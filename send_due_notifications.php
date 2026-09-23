@@ -296,8 +296,8 @@ foreach ($tasks as $task) {
     if (!$subs) {
         echo "  Task {$task['task_id']}: no subscriptions for user {$task['user_id']}, skipping.\n";
         // Still mark sent so we don't retry forever
-        $pdo->prepare('INSERT IGNORE INTO notifications_sent (user_id, task_id, type) VALUES (?, ?, ?)')
-            ->execute([(int) $task['user_id'], $task['task_id'], 'due']);
+        $pdo->prepare('INSERT IGNORE INTO notifications_sent (task_id) VALUES (?)')
+            ->execute([$task['task_id']]);
         continue;
     }
 
@@ -322,8 +322,8 @@ foreach ($tasks as $task) {
     }
 
     // Mark as sent regardless (avoid repeated failed retries)
-    $pdo->prepare('INSERT IGNORE INTO notifications_sent (user_id, task_id, type) VALUES (?, ?, ?)')
-        ->execute([(int) $task['user_id'], $task['task_id'], 'due']);
+    $pdo->prepare('INSERT IGNORE INTO notifications_sent (task_id) VALUES (?)')
+        ->execute([$task['task_id']]);
 }
 
 echo date('c') . " — Done.\n";
