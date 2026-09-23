@@ -19,7 +19,7 @@ $theme = 'dark';
     <link rel="shortcut icon" href="./icons/icon-192.png" type="image/x-icon">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=<?= filemtime(__DIR__ . '/style.css') ?>">
 </head>
 <body class="auth-page" data-auth-redirect="index.php">
     <main class="auth-shell">

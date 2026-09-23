@@ -17,11 +17,12 @@ class DB {
         $opts = [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false,
+            PDO::ATTR_EMULATE_PREPARES => true,
         ];
 
         try {
             self::$pdo = new PDO($dsn, $user, $pass, $opts);
+            @self::$pdo->exec("SET SESSION sql_mode = (SELECT REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', ''))");
             return self::$pdo;
         } catch (PDOException $e) {
             http_response_code(500);

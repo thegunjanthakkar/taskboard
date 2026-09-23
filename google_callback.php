@@ -83,17 +83,24 @@ if (empty($user['email'])) {
 // Find or create user
 try {
     $pdo = DB::get();
-    $stmt = $pdo->prepare('SELECT id FROM users WHERE email = ?');
+    $stmt = $pdo->prepare('SELECT id, name FROM users WHERE email = ?');
     $stmt->execute([$user['email']]);
     $row = $stmt->fetch();
     if ($row) {
         $userId = $row['id'];
+        $displayName = $user['name'] ?? ($row['name'] ?? explode('@', $user['email'])[0]);
+        if (empty($row['name']) && !empty($user['name'])) {
+            $uStmt = $pdo->prepare('UPDATE users SET name = ? WHERE id = ?');
+            $uStmt->execute([$user['name'], $userId]);
+        }
     } else {
+        $displayName = $user['name'] ?? explode('@', $user['email'])[0];
         $stmt = $pdo->prepare('INSERT INTO users (email, name, created_at) VALUES (?, ?, NOW())');
-        $stmt->execute([$user['email'], $user['name'] ?? null]);
+        $stmt->execute([$user['email'], $displayName]);
         $userId = $pdo->lastInsertId();
     }
-    $_SESSION['auth_user'] = ['id' => $userId, 'email' => $user['email']];
+
+    $_SESSION['auth_user'] = ['id' => $userId, 'email' => $user['email'], 'name' => $displayName];
     $_SESSION['user_id'] = 'user_' . $userId;
     header('Location: index.php');
     exit;

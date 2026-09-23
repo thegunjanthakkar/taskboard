@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tasksboard-v2';
+const CACHE_NAME = 'tasksboard-v3';
 const STATIC_ASSETS = [
     './',
     './style.css',
@@ -27,22 +27,30 @@ self.addEventListener('activate', event => {
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 self.addEventListener('fetch', event => {
     const url = new URL(event.request.url);
+
+    // Always network for PHP endpoints
     if (url.pathname.endsWith('.php')) {
-        // Always network for PHP
         event.respondWith(fetch(event.request));
         return;
     }
-    event.respondWith(
-        caches.match(event.request).then(cached => {
-            if (cached) return cached;
-            return fetch(event.request).then(response => {
-                if (response.ok && event.request.method === 'GET') {
-                    caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()));
-                }
-                return response;
-            }).catch(() => cached || new Response('Offline', { status: 503 }));
-        })
-    );
+
+    // Network-first for static assets, fallback to cache if offline
+    if (event.request.method === 'GET') {
+        event.respondWith(
+            fetch(event.request)
+                .then(response => {
+                    if (response.ok) {
+                        const clone = response.clone();
+                        caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+                    }
+                    return response;
+                })
+                .catch(() => caches.match(event.request).then(cached => cached || new Response('Offline', { status: 503 })))
+        );
+        return;
+    }
+
+    event.respondWith(fetch(event.request));
 });
 
 // ── Push Notifications (server-sent via WebPush) ──────────────────────────────

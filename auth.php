@@ -36,11 +36,12 @@ if ($action === 'signup') {
     }
 
     $hash = password_hash($password, PASSWORD_DEFAULT);
-    $stmt = $pdo->prepare('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, NOW())');
-    $stmt->execute([$email, $hash]);
+    $defaultName = explode('@', $email)[0];
+    $stmt = $pdo->prepare('INSERT INTO users (email, password_hash, name, created_at) VALUES (?, ?, ?, NOW())');
+    $stmt->execute([$email, $hash, $defaultName]);
     $userId = $pdo->lastInsertId();
 
-    $_SESSION['auth_user'] = ['id' => $userId, 'email' => $email];
+    $_SESSION['auth_user'] = ['id' => $userId, 'email' => $email, 'name' => $defaultName];
     $_SESSION['user_id'] = 'user_' . $userId;
     echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
     exit;
@@ -54,7 +55,7 @@ if ($action === 'signup') {
         exit;
     }
 
-    $stmt = $pdo->prepare('SELECT id, password_hash FROM users WHERE email = ?');
+    $stmt = $pdo->prepare('SELECT id, name, password_hash FROM users WHERE email = ?');
     $stmt->execute([$email]);
     $row = $stmt->fetch();
     if (!$row || !password_verify($password, $row['password_hash'])) {
@@ -63,7 +64,8 @@ if ($action === 'signup') {
         exit;
     }
 
-    $_SESSION['auth_user'] = ['id' => $row['id'], 'email' => $email];
+    $name = $row['name'] ?: explode('@', $email)[0];
+    $_SESSION['auth_user'] = ['id' => $row['id'], 'email' => $email, 'name' => $name];
     $_SESSION['user_id'] = 'user_' . $row['id'];
     echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
     exit;

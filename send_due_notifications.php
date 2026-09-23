@@ -121,6 +121,13 @@ foreach ($tasks as $task) {
     $subsStmt->execute([(int) $task['user_id']]);
     $subs = $subsStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Insert in-app notification
+    try {
+        $notifId = 'notif_' . uniqid() . '_' . bin2hex(random_bytes(4));
+        $pdo->prepare('INSERT INTO notifications (id, user_id, actor_id, type, title, message, entity_type, entity_id, is_read, created_at) VALUES (?, ?, NULL, "due", ?, ?, "task", ?, 0, NOW())')
+            ->execute([$notifId, (int) $task['user_id'], '⏰ Task Due: ' . $task['title'], $task['description'] ?: 'This task is now due.', $task['task_id']]);
+    } catch (Exception $e) {}
+
     if (!$subs) {
         echo "  Task {$task['task_id']}: no subscriptions for user {$task['user_id']}, skipping.\n";
         // Still mark sent so we don't retry forever
