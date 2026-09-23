@@ -102,7 +102,15 @@ try {
 
     $_SESSION['auth_user'] = ['id' => $userId, 'email' => $user['email'], 'name' => $displayName];
     $_SESSION['user_id'] = 'user_' . $userId;
-    header('Location: index.php');
+
+    $targetBoard = $_SESSION['oauth_redirect_board'] ?? null;
+    unset($_SESSION['oauth_redirect_board']);
+
+    if ($targetBoard) {
+        header('Location: index.php?board=' . urlencode($targetBoard));
+    } else {
+        header('Location: index.php');
+    }
     exit;
 } catch (Exception $e) {
     echo 'Database error: ' . $e->getMessage();

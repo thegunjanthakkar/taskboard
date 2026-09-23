@@ -3,7 +3,8 @@ session_start();
 $authUser = $_SESSION['auth_user'] ?? null;
 
 if (!$authUser) {
-    header('Location: login.php');
+    $qs = !empty($_SERVER['QUERY_STRING']) ? '?' . $_SERVER['QUERY_STRING'] : '';
+    header('Location: login.php' . $qs);
     exit;
 }
 
@@ -351,9 +352,13 @@ $userEmail = htmlspecialchars($authUser['email']);
                         </svg>
                         <span>Recent Activity</span>
                     </div>
+                    <button class="btn btn-ghost btn-xs" id="dashViewAllActivityBtn" title="View all activity logs">View All &rarr;</button>
                 </div>
                 <div class="dash-activity-list" id="dashActivityList">
                     <div class="empty-state-sm">No recent activity</div>
+                </div>
+                <div class="dash-panel-footer" id="dashActivityFooter" style="display:none">
+                    <button class="btn-link-subtle" id="dashViewAllActivityFooterBtn">View all activity &rarr;</button>
                 </div>
             </div>
         </div>
@@ -504,6 +509,89 @@ $userEmail = htmlspecialchars($authUser['email']);
         </div>
     </div>
 
+    <!-- ========================================== -->
+    <!-- VIEW 5: ACTIVITY LOG VIEW                  -->
+    <!-- ========================================== -->
+    <div class="view" id="view-activity" style="display:none">
+        <div class="view-header">
+            <div class="view-header-left">
+                <button class="btn btn-ghost btn-sm" id="activityBackBtn" style="margin-right:8px" title="Back to Dashboard">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+                    </svg>
+                    Back to Dashboard
+                </button>
+                <h1 class="view-title">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                    </svg>
+                    Activity Log
+                </h1>
+            </div>
+        </div>
+        <div class="activity-page-container">
+            <div class="activity-page-card">
+                <div class="activity-full-list" id="fullActivityList">
+                    <div class="empty-state-sm">Loading activity...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- VIEW 6: REQUEST ACCESS VIEW (Google Drive) -->
+    <!-- ========================================== -->
+    <div class="view" id="view-request-access" style="display:none">
+        <div class="request-access-container">
+            <div class="request-access-card">
+                <div class="request-access-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                </div>
+                <h1 class="request-access-title">You need access</h1>
+                <p class="request-access-desc">
+                    You are signed in as <strong id="reqAccUserEmail"><?= $userEmail ?></strong>.<br>
+                    Ask the board owner for access:
+                </p>
+                <div class="request-board-badge">
+                    <span class="board-nav-dot" id="reqAccBoardDot" style="background:#4f8ef7"></span>
+                    <div class="req-badge-text">
+                        <div class="req-board-name" id="reqAccBoardName">Board Name</div>
+                        <div class="req-board-owner" id="reqAccOwnerName">Owned by Owner</div>
+                    </div>
+                </div>
+                <div class="request-access-form" id="reqAccForm">
+                    <label for="reqAccMessage" class="form-label" style="text-align:left; margin-bottom:6px">Message (optional)</label>
+                    <textarea id="reqAccMessage" class="form-input form-textarea" rows="2" placeholder="Tell the owner why you need access..."></textarea>
+                    <div class="req-actions">
+                        <button class="btn btn-secondary" id="reqAccCancelBtn">Go to Dashboard</button>
+                        <button class="btn btn-primary" id="reqAccSubmitBtn">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="22" y1="2" x2="11" y2="13"/>
+                                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                            </svg>
+                            Request access
+                        </button>
+                    </div>
+                </div>
+                <div class="request-access-status" id="reqAccStatus" style="display:none">
+                    <div class="req-status-icon">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
+                        </svg>
+                    </div>
+                    <div class="req-status-text">
+                        <div class="req-status-title">Access requested</div>
+                        <div class="req-status-desc">The board owner has been notified. You will get access once they approve your request.</div>
+                    </div>
+                    <button class="btn btn-secondary btn-sm" id="reqAccBackBtn" style="margin-top:16px">Return to Dashboard</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
 </main>
 
 <!-- Bottom Navigation (Mobile) -->
@@ -645,22 +733,27 @@ $userEmail = htmlspecialchars($authUser['email']);
         </div>
 
         <!-- Labels Section -->
-        <div class="drawer-section">
+        <div class="drawer-section drawer-section-labels">
             <div class="drawer-section-title">
                 <span>Labels</span>
+                <button class="btn-chip" id="drawerAddLabelBtn" type="button">+ Add Label</button>
             </div>
             <div class="drawer-labels-wrap">
                 <div class="drawer-labels-list" id="drawerLabelsList"></div>
-                <button class="btn-chip" id="drawerAddLabelBtn">+ Add Label</button>
             </div>
-            <!-- Quick Label Picker Dropdown -->
+            <!-- Quick Label Picker Dropdown / Inline Panel -->
             <div class="label-picker-dropdown" id="labelPickerDropdown" style="display:none">
-                <div class="label-picker-header">Labels</div>
+                <div class="label-picker-header">
+                    <span>Select or Create Label</span>
+                    <button class="label-picker-close-btn" id="labelPickerCloseBtn" type="button" title="Close">&times;</button>
+                </div>
                 <div class="label-picker-items" id="labelPickerItems"></div>
                 <div class="label-picker-create">
-                    <input type="text" id="newLabelInput" placeholder="New label name..." class="form-input form-input-xs">
+                    <div class="label-create-input-row">
+                        <input type="text" id="newLabelInput" placeholder="New label name..." class="form-input form-input-sm" autocomplete="off">
+                        <button class="btn btn-primary btn-sm" id="createLabelBtn" type="button">Add</button>
+                    </div>
                     <div class="color-swatches" id="labelColorSwatches"></div>
-                    <button class="btn btn-primary btn-xs" id="createLabelBtn">Create</button>
                 </div>
             </div>
         </div>
@@ -787,6 +880,10 @@ $userEmail = htmlspecialchars($authUser['email']);
                     <select id="taskBoardList" class="form-input form-select"></select>
                 </div>
             </div>
+            <div class="form-group">
+                <label>Labels</label>
+                <div class="modal-labels-picker" id="modalLabelsPicker"></div>
+            </div>
         </div>
         <div class="modal-footer">
             <button class="btn btn-ghost" id="taskModalCancel">Cancel</button>
@@ -795,7 +892,7 @@ $userEmail = htmlspecialchars($authUser['email']);
     </div>
 </div>
 
-<!-- Share Board Modal -->
+<!-- Share Board Modal (Google Drive Style) -->
 <div class="modal-overlay" id="shareModal">
     <div class="modal modal-share">
         <div class="modal-header">
@@ -806,39 +903,85 @@ $userEmail = htmlspecialchars($authUser['email']);
             <button class="modal-close" id="shareModalClose">&times;</button>
         </div>
         <div class="modal-body">
-            <div class="share-link-box">
-                <label class="form-label">Board Direct Link</label>
-                <div class="share-link-input-group">
-                    <input type="text" id="shareLinkInput" class="form-input" readonly>
-                    <button class="btn btn-primary btn-sm" id="copyShareLinkBtn">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                        </svg>
-                        Copy
-                    </button>
-                </div>
-            </div>
-
+            <!-- 1. Add People & Groups / Invite by Email -->
             <div class="share-invite-form" id="shareInviteForm">
-                <label class="form-label">Invite Collaborator by Email</label>
-                <div class="invite-inputs">
-                    <input type="email" id="inviteEmail" placeholder="colleague@example.com" class="form-input" autocomplete="email">
-                    <select id="inviteRole" class="form-input form-select role-select">
-                        <option value="editor">Editor (Can edit)</option>
-                        <option value="viewer">Viewer (View only)</option>
+                <label class="form-label" style="margin-bottom: 8px">Add people and collaborators</label>
+                <div class="invite-inputs-row">
+                    <div class="invite-input-wrapper">
+                        <svg class="invite-input-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                            <polyline points="22,6 12,13 2,6"/>
+                        </svg>
+                        <input type="email" id="inviteEmail" placeholder="Add email to invite (e.g. alex@company.com)..." class="form-input invite-email-input" autocomplete="email">
+                    </div>
+                    <select id="inviteRole" class="form-input form-select invite-role-select">
+                        <option value="editor">Editor</option>
+                        <option value="viewer">Viewer</option>
                     </select>
-                    <button class="btn btn-primary" id="inviteBtn">Invite</button>
+                    <button class="btn btn-primary invite-btn" id="inviteBtn">Send</button>
                 </div>
-                <div id="inviteError" class="auth-message" style="display:none"></div>
+                <div id="inviteError" class="auth-message" style="display:none; margin-top:8px"></div>
             </div>
 
+            <!-- 2. Pending Access Requests (Google Drive Style) -->
+            <div class="share-requests-section" id="shareRequestsSection" style="display:none">
+                <div class="share-section-heading">
+                    <span class="form-label">Access Requests (<span id="shareRequestsCount">0</span>)</span>
+                    <span class="req-pending-badge">Pending review</span>
+                </div>
+                <div class="share-requests-list" id="shareRequestsList"></div>
+            </div>
+
+            <!-- 3. People with access -->
             <div class="share-members-section">
-                <label class="form-label">Collaborators (<span id="shareMemberCount">1</span>)</label>
+                <div class="share-section-heading">
+                    <span class="form-label">People with access</span>
+                    <span class="share-member-count-badge" id="shareMemberCount">1</span>
+                </div>
                 <div class="share-members-list" id="shareMembersList"></div>
             </div>
+
+            <!-- 4. General Access Section (Google Drive Style) -->
+            <div class="share-general-section">
+                <span class="form-label" style="margin-bottom: 8px">General access</span>
+                <div class="general-access-card">
+                    <div class="general-access-icon-col">
+                        <div class="access-icon-circle" id="generalAccessIcon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <line x1="2" y1="12" x2="22" y2="12"/>
+                                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                            </svg>
+                        </div>
+                    </div>
+                    <div class="general-access-info-col">
+                        <div class="general-access-selects">
+                            <select id="generalAccessSelect" class="form-input form-select general-access-select">
+                                <option value="anyone_with_link">Anyone with the link</option>
+                                <option value="restricted">Restricted</option>
+                            </select>
+                            <select id="linkRoleSelect" class="form-input form-select link-role-select">
+                                <option value="editor">Editor</option>
+                                <option value="viewer">Viewer</option>
+                            </select>
+                        </div>
+                        <div class="general-access-desc" id="generalAccessDesc">
+                            Anyone on the internet with the link can join and collaborate.
+                        </div>
+                    </div>
+                </div>
+
+                <input type="text" id="shareLinkInput" class="form-input share-link-hidden-input" readonly>
+            </div>
         </div>
-        <div class="modal-footer">
-            <button class="btn btn-ghost" id="shareModalDone">Done</button>
+        <div class="modal-footer share-modal-footer">
+            <button class="btn btn-secondary copy-link-footer-btn" id="copyShareLinkBtn">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+                <span>Copy link</span>
+            </button>
+            <button class="btn btn-primary" id="shareModalDone">Done</button>
         </div>
     </div>
 </div>

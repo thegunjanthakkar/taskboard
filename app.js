@@ -64,18 +64,66 @@ async function init() {
     await registerServiceWorker();
     checkNotifPermission();
 
-    // Support URL direct board links
+    // Support URL direct board links & auto-joining shared boards
     const urlParams = new URLSearchParams(window.location.search);
     const requestedBoard = urlParams.get('board');
-    if (requestedBoard && state.boards.some(b => b.id === requestedBoard)) {
-        setView('board', requestedBoard);
+    if (requestedBoard) {
+        const existing = state.boards.find(b => b.id === requestedBoard);
+        if (existing) {
+            setView('board', requestedBoard);
+        } else {
+            // Attempt to join / load board via shared link
+            const joinRes = await apiCall('joinBoardByLink', { boardId: requestedBoard });
+            if (joinRes && joinRes.restricted) {
+                // Restricted mode (Google Drive style): Show request access view
+                showRequestAccessView(joinRes);
+            } else if (joinRes && joinRes.success && joinRes.boards) {
+                state.boards = joinRes.boards;
+                state.activeBoardId = requestedBoard;
+                renderSidebar();
+                setView('board', requestedBoard);
+                if (!joinRes.alreadyMember) {
+                    showToast(`Joined "${joinRes.boardName || 'shared'}" board! 🎉`, 'success');
+                }
+            } else {
+                showToast(joinRes?.error || 'Board not found or no longer available', 'error');
+                setView('dashboard');
+            }
+        }
     } else {
         setView('dashboard');
     }
 
     renderSidebar();
-    loadNotifications();
+    loadNotifications(true);
+    // Poll for collaborative updates and notifications every 5 seconds
+    setInterval(() => {
+        loadNotifications(false);
+    }, 5000);
     scheduleAllNotifications();
+}
+
+function showRequestAccessView(info) {
+    state.pendingRequestBoardId = info.boardId;
+    const nameEl = document.getElementById('reqAccBoardName');
+    const ownerEl = document.getElementById('reqAccOwnerName');
+    if (nameEl) nameEl.textContent = info.boardName || 'Board';
+    if (ownerEl) ownerEl.textContent = `Owned by ${info.ownerName || info.ownerEmail || 'Owner'}`;
+    
+    const form = document.getElementById('reqAccForm');
+    const status = document.getElementById('reqAccStatus');
+    const msgInput = document.getElementById('reqAccMessage');
+    if (msgInput) msgInput.value = '';
+
+    if (info.hasRequested && info.requestStatus === 'pending') {
+        if (form) form.style.display = 'none';
+        if (status) status.style.display = '';
+    } else {
+        if (form) form.style.display = '';
+        if (status) status.style.display = 'none';
+    }
+
+    setView('request-access');
 }
 
 function detectCurrentUserId() {
@@ -127,11 +175,26 @@ function setView(view, boardId = null) {
         if (anaEl) anaEl.style.display = '';
         document.getElementById('nav-analytics')?.classList.add('active');
         loadAnalytics();
+    } else if (view === 'activity') {
+        const actEl = document.getElementById('view-activity');
+        if (actEl) actEl.style.display = '';
+        loadFullActivity();
+    } else if (view === 'request-access') {
+        const reqEl = document.getElementById('view-request-access');
+        if (reqEl) reqEl.style.display = '';
     } else if (view === 'board') {
         const boardEl = document.getElementById('view-board');
         if (boardEl) boardEl.style.display = '';
         document.getElementById('bnav-board')?.classList.add('active');
-        if (boardId) state.activeBoardId = boardId;
+        if (boardId) {
+            state.activeBoardId = boardId;
+            if (!state.boards.some(b => b.id === boardId)) {
+                loadBoards().then(() => {
+                    renderSidebar();
+                    renderBoard();
+                });
+            }
+        }
         renderBoard();
     }
 
@@ -248,15 +311,19 @@ function renderDashboard(data) {
         }
     }
 
-    // Render Activity Feed
+    // Render Activity Feed (Only 5 shown on dashboard)
     const activityContainer = document.getElementById('dashActivityList');
+    const activityFooter = document.getElementById('dashActivityFooter');
     if (activityContainer) {
         activityContainer.innerHTML = '';
         const acts = data.recentActivity || [];
+        const top5 = acts.slice(0, 5); // Show only 5 activities in dashboard
+
         if (acts.length === 0) {
-            activityContainer.innerHTML = `<div class="empty-state-sm">No recent team activities logged yet.</div>`;
+            activityContainer.innerHTML = `<div class="empty-state-sm">No recent activity logged yet.</div>`;
+            if (activityFooter) activityFooter.style.display = 'none';
         } else {
-            acts.forEach(act => {
+            top5.forEach(act => {
                 const item = document.createElement('div');
                 item.className = 'dash-activity-item';
                 const timeAgo = formatTimeAgo(act.created_at);
@@ -274,6 +341,10 @@ function renderDashboard(data) {
                 `;
                 activityContainer.appendChild(item);
             });
+
+            if (activityFooter) {
+                activityFooter.style.display = acts.length > 5 ? 'flex' : 'none';
+            }
         }
     }
 }
@@ -311,13 +382,17 @@ function renderSidebar() {
 
     if (sharedBoards.length > 0) {
         if (sharedSection) sharedSection.style.display = '';
+        document.getElementById('sharedBoardsSubmenu')?.classList.add('open');
+        document.querySelector('#sharedToggle .chevron')?.classList.add('open');
         sharedBoards.forEach(board => {
             const a = document.createElement('a');
             a.className = 'nav-item' + (board.id === state.activeBoardId && state.currentView === 'board' ? ' active' : '');
             a.href = '#';
+            const ownerBadge = board.owner_name ? `<span class="shared-by-badge">by ${escHtml(board.owner_name)}</span>` : '';
             a.innerHTML = `
                 <span class="board-nav-dot" style="background: ${board.color || '#4f8ef7'}"></span>
-                <span class="board-item-name">${escHtml(board.name)}</span>
+                <span class="board-item-name" title="${escHtml(board.name)}${board.owner_name ? ' (by ' + escHtml(board.owner_name) + ')' : ''}">${escHtml(board.name)}</span>
+                ${ownerBadge}
                 <span class="shared-role-pill">${escHtml(board.user_role || 'shared')}</span>
             `;
             a.addEventListener('click', e => {
@@ -419,8 +494,10 @@ function renderListColumn(board, list) {
     col.dataset.listId = list.id;
     col.dataset.boardId = board.id;
 
-    const completedCount = list.tasks.filter(t => t.completed).length;
-    const total = list.tasks.length;
+    const todayStr = getTodayStr();
+    const activeTasks = list.tasks.filter(t => !isFutureRecurringTask(t, todayStr));
+    const completedCount = activeTasks.filter(t => t.completed && !isPastCompletedRecurringTask(t, todayStr)).length;
+    const total = activeTasks.filter(t => !isPastCompletedRecurringTask(t, todayStr)).length;
     const pct = total > 0 ? Math.round((completedCount / total) * 100) : 0;
 
     col.innerHTML = `
@@ -616,11 +693,11 @@ function renderAddListColumn(board) {
     const col = document.createElement('div');
     col.className = 'add-list-column';
     col.innerHTML = `
-        <button class="add-list-btn" id="inlineAddListBtn">
+        <button class="add-list-btn add-list-btn-card" id="inlineAddListBtn">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                 <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
-            Add Column
+            <span>Add Column</span>
         </button>
     `;
     col.querySelector('#inlineAddListBtn').addEventListener('click', () => {
@@ -1252,36 +1329,57 @@ function renderDrawerLabels(assignedLabels, allBoardLabels) {
     if (!wrap) return;
     wrap.innerHTML = '';
 
-    assignedLabels.forEach(l => {
-        const pill = document.createElement('span');
-        pill.className = 'label-pill-interactive';
-        pill.style.setProperty('--lbl-bg', l.color || '#4f8ef7');
-        pill.innerHTML = `
-            <span>${escHtml(l.name)}</span>
-            <button class="label-remove-btn" title="Remove">&times;</button>
-        `;
-        pill.querySelector('.label-remove-btn').addEventListener('click', async () => {
-            if (!state.activeTaskDetails) return;
-            const res = await apiCall('toggleTaskLabel', { taskId: state.activeTaskDetails.task.id, labelId: l.id });
-            if (res.success) {
-                renderDrawerLabels(res.assignedLabels, allBoardLabels);
-                await loadBoards();
-                renderBoard();
-            }
+    const currentAssigned = state.activeTaskDetails?.assignedLabels || assignedLabels || [];
+
+    if (currentAssigned.length === 0) {
+        wrap.innerHTML = '<span class="empty-labels-hint">No labels yet. Click "+ Add Label" to tag this task.</span>';
+    } else {
+        currentAssigned.forEach(l => {
+            const pill = document.createElement('span');
+            pill.className = 'label-pill-interactive';
+            pill.style.setProperty('--lbl-bg', l.color || '#4f8ef7');
+            pill.innerHTML = `
+                <span>${escHtml(l.name)}</span>
+                <button class="label-remove-btn" title="Remove label">&times;</button>
+            `;
+            pill.querySelector('.label-remove-btn').addEventListener('click', async e => {
+                e.stopPropagation();
+                if (!state.activeTaskDetails) return;
+                const res = await apiCall('toggleTaskLabel', { taskId: state.activeTaskDetails.task.id, labelId: l.id });
+                if (res.success) {
+                    state.activeTaskDetails.assignedLabels = res.assignedLabels;
+                    renderDrawerLabels(res.assignedLabels, allBoardLabels);
+                    populateLabelPicker(res.assignedLabels, allBoardLabels);
+                    await loadBoards();
+                    renderBoard();
+                } else {
+                    showToast(res.error || 'Failed to remove label', 'error');
+                }
+            });
+            wrap.appendChild(pill);
         });
-        wrap.appendChild(pill);
-    });
+    }
 
     // Label Picker Popup Trigger
     const addBtn = document.getElementById('drawerAddLabelBtn');
     const picker = document.getElementById('labelPickerDropdown');
-    const pickerItems = document.getElementById('labelPickerItems');
+    const closeBtn = document.getElementById('labelPickerCloseBtn');
+
+    if (closeBtn && picker) {
+        closeBtn.onclick = () => {
+            picker.style.display = 'none';
+        };
+    }
 
     if (addBtn && picker) {
-        addBtn.onclick = () => {
+        addBtn.onclick = e => {
+            e.stopPropagation();
             const isOpen = picker.style.display !== 'none';
             picker.style.display = isOpen ? 'none' : 'block';
-            if (!isOpen) populateLabelPicker(assignedLabels, allBoardLabels);
+            if (!isOpen) {
+                populateLabelPicker(state.activeTaskDetails?.assignedLabels || assignedLabels, allBoardLabels);
+                setTimeout(() => document.getElementById('newLabelInput')?.focus(), 50);
+            }
         };
     }
 }
@@ -1291,28 +1389,38 @@ function populateLabelPicker(assignedLabels, allBoardLabels) {
     if (!itemsEl) return;
     itemsEl.innerHTML = '';
 
-    const assignedIds = new Set(assignedLabels.map(l => l.id));
+    const currentAssigned = state.activeTaskDetails?.assignedLabels || assignedLabels || [];
+    const assignedIds = new Set(currentAssigned.map(l => l.id));
 
-    allBoardLabels.forEach(l => {
-        const item = document.createElement('div');
-        item.className = 'label-picker-row' + (assignedIds.has(l.id) ? ' is-active' : '');
-        item.innerHTML = `
-            <span class="label-picker-dot" style="background:${l.color}"></span>
-            <span class="label-picker-name">${escHtml(l.name)}</span>
-            ${assignedIds.has(l.id) ? `<span class="label-check">✓</span>` : ''}
-        `;
-        item.onclick = async () => {
-            if (!state.activeTaskDetails) return;
-            const res = await apiCall('toggleTaskLabel', { taskId: state.activeTaskDetails.task.id, labelId: l.id });
-            if (res.success) {
-                renderDrawerLabels(res.assignedLabels, allBoardLabels);
-                populateLabelPicker(res.assignedLabels, allBoardLabels);
-                await loadBoards();
-                renderBoard();
-            }
-        };
-        itemsEl.appendChild(item);
-    });
+    if (!allBoardLabels || allBoardLabels.length === 0) {
+        itemsEl.innerHTML = '<div class="empty-state-sm" style="padding:10px 4px;font-size:0.8rem;color:var(--text-tertiary)">No labels available. Create one below:</div>';
+    } else {
+        allBoardLabels.forEach(l => {
+            const item = document.createElement('div');
+            const isActive = assignedIds.has(l.id);
+            item.className = 'label-picker-row' + (isActive ? ' is-active' : '');
+            item.innerHTML = `
+                <span class="label-picker-dot" style="background:${l.color || '#4f8ef7'}"></span>
+                <span class="label-picker-name">${escHtml(l.name)}</span>
+                ${isActive ? '<span class="label-check">✓</span>' : ''}
+            `;
+            item.onclick = async e => {
+                e.stopPropagation();
+                if (!state.activeTaskDetails) return;
+                const res = await apiCall('toggleTaskLabel', { taskId: state.activeTaskDetails.task.id, labelId: l.id });
+                if (res.success) {
+                    state.activeTaskDetails.assignedLabels = res.assignedLabels;
+                    renderDrawerLabels(res.assignedLabels, allBoardLabels);
+                    populateLabelPicker(res.assignedLabels, allBoardLabels);
+                    await loadBoards();
+                    renderBoard();
+                } else {
+                    showToast(res.error || 'Failed to update label', 'error');
+                }
+            };
+            itemsEl.appendChild(item);
+        });
+    }
 
     // Swatches for new label creation
     const swatchesEl = document.getElementById('labelColorSwatches');
@@ -1336,22 +1444,40 @@ function populateLabelPicker(assignedLabels, allBoardLabels) {
         const createBtn = document.getElementById('createLabelBtn');
         const input = document.getElementById('newLabelInput');
 
-        if (createBtn) {
-            createBtn.onclick = async () => {
-                const name = input.value.trim();
-                if (!name || !state.activeTaskDetails) return;
-                const res = await apiCall('createLabel', {
-                    boardId: state.activeTaskDetails.task.board_id,
-                    name,
-                    color: selectedColor
-                });
-                if (res.success) {
-                    input.value = '';
-                    // Automatically toggle newly created label
-                    await apiCall('toggleTaskLabel', { taskId: state.activeTaskDetails.task.id, labelId: res.newLabelId });
-                    openTaskDrawer(state.activeTaskDetails.task.id);
-                    await loadBoards();
-                    renderBoard();
+        const handleCreate = async () => {
+            const name = input.value.trim();
+            if (!name || !state.activeTaskDetails) return;
+            const res = await apiCall('createLabel', {
+                boardId: state.activeTaskDetails.task.board_id,
+                name,
+                color: selectedColor
+            });
+            if (res.success) {
+                input.value = '';
+                const newLabel = { id: res.newLabelId, name, color: selectedColor };
+                if (allBoardLabels && !allBoardLabels.some(x => x.id === newLabel.id)) {
+                    allBoardLabels.push(newLabel);
+                }
+                // Automatically assign newly created label to current task
+                const toggleRes = await apiCall('toggleTaskLabel', { taskId: state.activeTaskDetails.task.id, labelId: res.newLabelId });
+                const updatedAssigned = toggleRes.success ? toggleRes.assignedLabels : [...currentAssigned, newLabel];
+                state.activeTaskDetails.assignedLabels = updatedAssigned;
+                renderDrawerLabels(updatedAssigned, allBoardLabels);
+                populateLabelPicker(updatedAssigned, allBoardLabels);
+                await loadBoards();
+                renderBoard();
+                showToast(`Label "${name}" created and added!`, 'success');
+            } else {
+                showToast(res.error || 'Failed to create label', 'error');
+            }
+        };
+
+        if (createBtn) createBtn.onclick = handleCreate;
+        if (input) {
+            input.onkeydown = e => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleCreate();
                 }
             };
         }
@@ -1485,27 +1611,80 @@ function renderDrawerHistory(history) {
     });
 }
 
-// ============================
-// In-App Notification Center
-// ============================
-async function loadNotifications() {
-    const res = await apiCall('getNotifications');
-    if (!res.success) return;
+let _lastSeenNotifId = null;
+let _isLiveSyncing = false;
 
-    state.notifications = res.notifications || [];
-    state.unreadNotifCount = res.unreadCount || 0;
+async function loadNotifications(isInitial = false) {
+    if (_isLiveSyncing) return;
+    _isLiveSyncing = true;
+    try {
+        const res = await apiCall('getNotifications');
+        if (!res || !res.success) return;
 
-    const badge = document.getElementById('notifBadge');
-    if (badge) {
-        if (state.unreadNotifCount > 0) {
-            badge.style.display = '';
-            badge.textContent = state.unreadNotifCount > 9 ? '9+' : state.unreadNotifCount;
-        } else {
-            badge.style.display = 'none';
+        const notifs = res.notifications || [];
+        const unreadCount = res.unreadCount || 0;
+
+        state.notifications = notifs;
+        state.unreadNotifCount = unreadCount;
+
+        const badge = document.getElementById('notifBadge');
+        if (badge) {
+            if (state.unreadNotifCount > 0) {
+                badge.style.display = '';
+                badge.textContent = state.unreadNotifCount > 9 ? '9+' : state.unreadNotifCount;
+            } else {
+                badge.style.display = 'none';
+            }
         }
-    }
 
-    renderNotificationList();
+        renderNotificationList();
+
+        if (notifs.length > 0) {
+            const newest = notifs[0];
+
+            // If not initial load and there are new unread notifications that arrived from other people
+            if (!isInitial && _lastSeenNotifId && newest.id !== _lastSeenNotifId) {
+                const incoming = [];
+                for (const n of notifs) {
+                    if (n.id === _lastSeenNotifId) break;
+                    if (!n.is_read) incoming.push(n);
+                }
+
+                if (incoming.length > 0) {
+                    const topN = incoming[0];
+                    showToast(`🔔 ${topN.title} — ${topN.message || ''}`, 'info');
+
+                    // If tab is in background and desktop notification permitted, show browser notification
+                    if (Notification.permission === 'granted' && document.hidden) {
+                        try {
+                            new Notification(topN.title, {
+                                body: topN.message || '',
+                                icon: 'icons/icon-192.png',
+                                tag: topN.id
+                            });
+                        } catch (err) {}
+                    }
+
+                    // Live auto-refresh of board / dashboard when changes occur
+                    await loadBoards();
+                    if (state.currentView === 'board') {
+                        renderBoard();
+                    } else if (state.currentView === 'dashboard') {
+                        loadDashboard();
+                    } else if (state.currentView === 'due') {
+                        renderDueToday();
+                    }
+                    updateDueTodayCount();
+                }
+            }
+
+            _lastSeenNotifId = newest.id;
+        }
+    } catch (e) {
+        // Non-fatal
+    } finally {
+        _isLiveSyncing = false;
+    }
 }
 
 function renderNotificationList() {
@@ -1709,6 +1888,70 @@ function renderAnalytics(data) {
 }
 
 // ============================
+// Full Activity Log View
+// ============================
+async function loadFullActivity() {
+    const listEl = document.getElementById('fullActivityList');
+    if (!listEl) return;
+    listEl.innerHTML = `<div class="empty-state-sm">Loading activity logs...</div>`;
+
+    const res = await apiCall('getAllActivity');
+    const acts = (res && res.activity) ? res.activity : [];
+
+    if (acts.length === 0) {
+        listEl.innerHTML = `
+            <div class="empty-state">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                </svg>
+                <p>No activity logs recorded yet.</p>
+            </div>
+        `;
+        return;
+    }
+
+    listEl.innerHTML = '';
+    acts.forEach(act => {
+        const item = document.createElement('div');
+        item.className = 'activity-full-item';
+        const timeAgo = formatTimeAgo(act.created_at);
+        const initials = getInitials(act.user_name || act.user_email || 'U');
+
+        let taskLink = '';
+        if (act.task_id && act.task_title) {
+            taskLink = `<span class="activity-task-link" data-task-id="${act.task_id}">📋 ${escHtml(act.task_title)}</span>`;
+        }
+
+        let boardTag = '';
+        if (act.board_name) {
+            boardTag = `<span class="board-mini-tag" style="--tag-color:${act.board_color || '#4f8ef7'}">${escHtml(act.board_name)}</span>`;
+        }
+
+        item.innerHTML = `
+            <div class="activity-full-avatar">${initials}</div>
+            <div class="activity-full-content">
+                <div class="activity-full-header">
+                    <span class="activity-full-user">${escHtml(act.user_name || act.user_email)}</span>
+                    <span class="activity-full-time" title="${act.created_at}">${timeAgo}</span>
+                </div>
+                <div class="activity-full-details">${escHtml(act.details || act.action)}</div>
+                <div class="activity-full-meta">
+                    ${boardTag}
+                    ${taskLink}
+                </div>
+            </div>
+        `;
+
+        item.querySelector('.activity-task-link')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openTaskDrawer(act.task_id);
+        });
+
+        listEl.appendChild(item);
+    });
+}
+
+// ============================
 // Command Palette (Ctrl+K)
 // ============================
 function openCommandPalette() {
@@ -1737,6 +1980,7 @@ function renderPaletteResults(query) {
         { label: 'Go to Dashboard', icon: '🏠', action: () => setView('dashboard') },
         { label: 'Go to Due Today', icon: '⏰', action: () => setView('due') },
         { label: 'Go to Analytics', icon: '📊', action: () => setView('analytics') },
+        { label: 'Go to Activity Log', icon: '⚡', action: () => setView('activity') },
         { label: 'Create New Task', icon: '➕', action: () => openTaskModal() },
         { label: 'Create New Board', icon: '📁', action: () => openBoardModal() },
         { label: 'Switch to Kanban View', icon: '☷', action: () => { setView('board'); setBoardViewMode('kanban'); } },
@@ -1867,7 +2111,8 @@ async function saveTask() {
         due_time: dueTime,
         priority: activePrio,
         recurrence: recurrence,
-        assigned_to: assignedTo ? parseInt(assignedTo, 10) : null
+        assigned_to: assignedTo ? parseInt(assignedTo, 10) : null,
+        label_ids: Array.from(state.modalSelectedLabelIds || [])
     };
 
     let res;
@@ -2034,6 +2279,47 @@ function openTaskModal(task = null, defaultListId = null, defaultBoardId = null)
         b.classList.toggle('active', b.dataset.priority === prio);
     });
 
+    // Populate modal labels picker
+    const modalLabelsEl = document.getElementById('modalLabelsPicker');
+    state.modalSelectedLabelIds = new Set((task && task.labels) ? task.labels.map(l => l.id) : []);
+
+    const updateModalLabels = () => {
+        if (!modalLabelsEl) return;
+        modalLabelsEl.innerHTML = '';
+        const currentSelectedBoardId = (boardListSelect.value ? boardListSelect.value.split(':')[0] : null) || (task ? task.board_id : state.activeBoardId);
+        const boardObj = state.boards.find(b => b.id === currentSelectedBoardId) || getActiveBoard();
+        const availableLabels = boardObj?.labels || [];
+
+        if (availableLabels.length === 0) {
+            modalLabelsEl.innerHTML = '<span style="font-size:0.78rem;color:var(--text-muted);font-style:italic">No labels on this board</span>';
+            return;
+        }
+
+        availableLabels.forEach(lbl => {
+            const chip = document.createElement('div');
+            const isActive = state.modalSelectedLabelIds.has(lbl.id);
+            chip.className = 'modal-label-chip' + (isActive ? ' active' : '');
+            chip.style.setProperty('--lbl-bg', lbl.color || '#4f8ef7');
+            chip.innerHTML = `
+                <span class="modal-label-dot" style="background:${lbl.color || '#4f8ef7'}"></span>
+                <span>${escHtml(lbl.name)}</span>
+                ${isActive ? '<span>✓</span>' : ''}
+            `;
+            chip.onclick = () => {
+                if (state.modalSelectedLabelIds.has(lbl.id)) {
+                    state.modalSelectedLabelIds.delete(lbl.id);
+                } else {
+                    state.modalSelectedLabelIds.add(lbl.id);
+                }
+                updateModalLabels();
+            };
+            modalLabelsEl.appendChild(chip);
+        });
+    };
+
+    updateModalLabels();
+    boardListSelect.onchange = updateModalLabels;
+
     modal.classList.add('open');
     setTimeout(() => nameInput.focus(), 100);
 }
@@ -2041,6 +2327,7 @@ function openTaskModal(task = null, defaultListId = null, defaultBoardId = null)
 function closeTaskModal() {
     document.getElementById('taskModal')?.classList.remove('open');
     state.editingTaskId = null;
+    state.modalSelectedLabelIds = new Set();
 }
 
 function openBoardModal(board = null) {
@@ -2169,7 +2456,7 @@ function renderDueToday() {
     if (!listEl) return;
     listEl.innerHTML = '';
 
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayStr();
     const dueTasks = [];
 
     state.boards.forEach(b => {
@@ -2196,18 +2483,30 @@ function renderDueToday() {
 
     dueTasks.forEach(({ task, list, board }) => {
         const item = document.createElement('div');
-        item.className = `due-today-item priority-${task.priority} ${task.completed ? 'completed' : ''}`;
+        item.className = `due-today-item due-task-card priority-${task.priority} ${task.completed ? 'completed' : ''}`;
         const dueInfo = getDueInfo(task);
         const dueClass = dueInfo.isOverdue ? 'overdue' : (dueInfo.isToday ? 'today' : '');
 
+        const labelsHtml = (task.labels || []).map(l =>
+            `<span class="label-pill-sm" style="--lbl-bg:${l.color || '#4f8ef7'}">${escHtml(l.name)}</span>`
+        ).join(' ');
+
         item.innerHTML = `
-            <div class="task-checkbox ${task.completed ? 'checked' : ''}"></div>
+            <div class="task-checkbox ${task.completed ? 'checked' : ''}" title="Toggle complete"></div>
             <div class="due-item-body">
                 <div class="due-item-title">${escHtml(task.title)}</div>
                 <div class="due-item-meta">
                     <span class="board-mini-tag" style="--tag-color:${board.color || '#4f8ef7'}">${escHtml(board.name)} › ${escHtml(list.name)}</span>
-                    <span class="task-due ${dueClass}">${dueInfo.label}</span>
+                    <span class="task-due ${dueClass}">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                        </svg>
+                        ${dueInfo.label}
+                    </span>
                     <span class="priority-badge ${task.priority}">${task.priority}</span>
+                    ${labelsHtml}
+                    ${task.subtask_count > 0 ? `<span class="card-pill" title="Subtasks">✓ ${task.subtask_done_count || 0}/${task.subtask_count}</span>` : ''}
+                    ${task.attachment_count > 0 ? `<span class="card-pill" title="Attachments">📎 ${task.attachment_count}</span>` : ''}
                 </div>
             </div>
         `;
@@ -2228,7 +2527,7 @@ function renderDueToday() {
 }
 
 function updateDueTodayCount() {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayStr();
     let count = 0;
     state.boards.forEach(b => {
         b.lists.forEach(l => {
@@ -2370,77 +2669,189 @@ function openShareModal() {
     const countEl = document.getElementById('shareMemberCount');
     const listEl = document.getElementById('shareMembersList');
     const inviteForm = document.getElementById('shareInviteForm');
+    const requestsSection = document.getElementById('shareRequestsSection');
+    const requestsList = document.getElementById('shareRequestsList');
+    const requestsCount = document.getElementById('shareRequestsCount');
+    const generalSelect = document.getElementById('generalAccessSelect');
+    const linkRoleSelect = document.getElementById('linkRoleSelect');
 
     title.textContent = `Share "${board.name}"`;
-    linkInput.value = `${window.location.origin}${window.location.pathname}?board=${board.id}`;
-
-    if (!board.is_owner) {
-        inviteForm.style.display = 'none';
-    } else {
-        inviteForm.style.display = '';
+    if (linkInput) {
+        linkInput.value = `${window.location.origin}${window.location.pathname}?board=${encodeURIComponent(board.id)}`;
     }
 
-    const members = board.members || [];
-    countEl.textContent = members.length;
-    listEl.innerHTML = '';
+    if (!board.is_owner) {
+        if (inviteForm) inviteForm.style.display = 'none';
+        if (requestsSection) requestsSection.style.display = 'none';
+        if (generalSelect) generalSelect.disabled = true;
+        if (linkRoleSelect) linkRoleSelect.disabled = true;
+    } else {
+        if (inviteForm) inviteForm.style.display = '';
+        if (generalSelect) generalSelect.disabled = false;
+        if (linkRoleSelect) linkRoleSelect.disabled = false;
+    }
 
-    members.forEach(m => {
-        const item = document.createElement('div');
-        item.className = 'share-member-item';
-        const isSelf = m.id === state.currentUserId;
-        const initials = getInitials(m.name || m.email);
+    // Set General Access Dropdown and Link Role Dropdown
+    const curGeneralAccess = board.general_access || 'anyone_with_link';
+    const curLinkRole = board.link_role || 'editor';
+    if (generalSelect) generalSelect.value = curGeneralAccess;
+    if (linkRoleSelect) linkRoleSelect.value = curLinkRole;
+    updateGeneralAccessUI(curGeneralAccess, curLinkRole);
 
-        item.innerHTML = `
-            <div class="share-member-avatar">${initials}</div>
-            <div class="share-member-info">
-                <div class="share-member-name">${escHtml(m.name || m.email)} ${isSelf ? '<span class="you-badge">(You)</span>' : ''}</div>
-                <div class="share-member-email">${escHtml(m.email)}</div>
-            </div>
-            <div class="share-member-action">
-                ${m.is_owner ? `<span class="owner-pill">Owner</span>` : (
-                    board.is_owner ? `
-                        <select class="form-select form-select-xs role-change-select" data-user-id="${m.id}">
-                            <option value="editor" ${m.role === 'editor' ? 'selected' : ''}>Editor</option>
-                            <option value="viewer" ${m.role === 'viewer' ? 'selected' : ''}>Viewer</option>
-                        </select>
-                        <button class="btn-ghost btn-xs remove-member-btn" data-user-id="${m.id}" title="Remove">&times;</button>
-                    ` : `<span class="role-pill">${escHtml(m.role || 'Member')}</span>`
-                )}
-            </div>
-        `;
+    // Pending Access Requests (Google Drive style)
+    const accessReqs = board.access_requests || [];
+    if (board.is_owner && accessReqs.length > 0) {
+        if (requestsSection) requestsSection.style.display = '';
+        if (requestsCount) requestsCount.textContent = accessReqs.length;
+        if (requestsList) {
+            requestsList.innerHTML = '';
+            accessReqs.forEach(req => {
+                const reqItem = document.createElement('div');
+                reqItem.className = 'share-request-item';
+                reqItem.innerHTML = `
+                    <div class="req-user-info">
+                        <div class="req-user-name">${escHtml(req.user_name || req.user_email)}</div>
+                        <div class="req-user-email">${escHtml(req.user_email)}</div>
+                        ${req.message ? `<div class="req-user-msg">"${escHtml(req.message)}"</div>` : ''}
+                    </div>
+                    <div class="req-actions-group">
+                        <button class="btn btn-primary btn-xs req-approve-btn" data-req-id="${req.id}">Approve</button>
+                        <button class="btn btn-ghost btn-xs req-decline-btn" data-req-id="${req.id}">Decline</button>
+                    </div>
+                `;
 
-        if (board.is_owner && !m.is_owner) {
-            item.querySelector('.role-change-select')?.addEventListener('change', async e => {
-                const res = await apiCall('updateMemberRole', {
-                    boardId: board.id,
-                    memberUserId: m.id,
-                    role: e.target.value
-                });
-                if (res.success) {
-                    state.boards = res.boards;
-                    renderBoard();
-                }
-            });
-
-            item.querySelector('.remove-member-btn')?.addEventListener('click', async () => {
-                if (confirm(`Remove ${m.name || m.email} from this board?`)) {
-                    const res = await apiCall('removeBoardMember', {
+                reqItem.querySelector('.req-approve-btn')?.addEventListener('click', async () => {
+                    const res = await apiCall('handleBoardAccessRequest', {
                         boardId: board.id,
-                        memberUserId: m.id
+                        requestId: req.id,
+                        action: 'approve',
+                        role: 'editor'
                     });
                     if (res.success) {
                         state.boards = res.boards;
                         renderBoard();
                         openShareModal();
+                        showToast(`Approved access for ${req.user_name || req.user_email}`, 'success');
                     }
-                }
+                });
+
+                reqItem.querySelector('.req-decline-btn')?.addEventListener('click', async () => {
+                    const res = await apiCall('handleBoardAccessRequest', {
+                        boardId: board.id,
+                        requestId: req.id,
+                        action: 'decline'
+                    });
+                    if (res.success) {
+                        state.boards = res.boards;
+                        renderBoard();
+                        openShareModal();
+                        showToast('Request declined', 'info');
+                    }
+                });
+
+                requestsList.appendChild(reqItem);
             });
         }
+    } else {
+        if (requestsSection) requestsSection.style.display = 'none';
+    }
 
-        listEl.appendChild(item);
-    });
+    // Members list
+    const members = board.members || [];
+    if (countEl) countEl.textContent = members.length;
+    if (listEl) {
+        listEl.innerHTML = '';
+        members.forEach(m => {
+            const item = document.createElement('div');
+            item.className = 'share-member-item';
+            const isSelf = m.id === state.currentUserId;
+            const initials = getInitials(m.name || m.email);
+
+            item.innerHTML = `
+                <div class="share-member-avatar">${initials}</div>
+                <div class="share-member-info">
+                    <div class="share-member-name">${escHtml(m.name || m.email)} ${isSelf ? '<span class="you-badge">(You)</span>' : ''}</div>
+                    <div class="share-member-email">${escHtml(m.email)}</div>
+                </div>
+                <div class="share-member-action">
+                    ${m.is_owner ? `<span class="owner-pill">Owner</span>` : (
+                        board.is_owner ? `
+                            <select class="form-select form-select-xs role-change-select" data-user-id="${m.id}">
+                                <option value="editor" ${m.role === 'editor' ? 'selected' : ''}>Editor</option>
+                                <option value="viewer" ${m.role === 'viewer' ? 'selected' : ''}>Viewer</option>
+                            </select>
+                            <button class="btn-ghost btn-xs remove-member-btn" data-user-id="${m.id}" title="Remove access">&times;</button>
+                        ` : `<span class="role-pill">${escHtml(m.role || 'Member')}</span>`
+                    )}
+                </div>
+            `;
+
+            if (board.is_owner && !m.is_owner) {
+                item.querySelector('.role-change-select')?.addEventListener('change', async e => {
+                    const res = await apiCall('updateMemberRole', {
+                        boardId: board.id,
+                        memberUserId: m.id,
+                        role: e.target.value
+                    });
+                    if (res.success) {
+                        state.boards = res.boards;
+                        renderBoard();
+                    }
+                });
+
+                item.querySelector('.remove-member-btn')?.addEventListener('click', async () => {
+                    if (confirm(`Remove ${m.name || m.email} from this board?`)) {
+                        const res = await apiCall('removeBoardMember', {
+                            boardId: board.id,
+                            memberUserId: m.id
+                        });
+                        if (res.success) {
+                            state.boards = res.boards;
+                            renderBoard();
+                            openShareModal();
+                        }
+                    }
+                });
+            }
+
+            listEl.appendChild(item);
+        });
+    }
 
     modal.classList.add('open');
+}
+
+function updateGeneralAccessUI(mode, role) {
+    const iconEl = document.getElementById('generalAccessIcon');
+    const descEl = document.getElementById('generalAccessDesc');
+    const roleSelect = document.getElementById('linkRoleSelect');
+
+    if (mode === 'restricted') {
+        if (iconEl) {
+            iconEl.className = 'access-icon-circle restricted';
+            iconEl.innerHTML = `
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+            `;
+        }
+        if (descEl) descEl.textContent = 'Only people with access can open with the link.';
+        if (roleSelect) roleSelect.style.display = 'none';
+    } else {
+        if (iconEl) {
+            iconEl.className = 'access-icon-circle';
+            iconEl.innerHTML = `
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="2" y1="12" x2="22" y2="12"/>
+                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                </svg>
+            `;
+        }
+        if (descEl) descEl.textContent = role === 'viewer' ? 'Anyone on the internet with the link can view.' : 'Anyone on the internet with the link can join and collaborate.';
+        if (roleSelect) roleSelect.style.display = '';
+    }
 }
 
 function closeShareModal() {
@@ -2478,9 +2889,23 @@ async function inviteMember() {
 
 function copyShareLink() {
     const input = document.getElementById('shareLinkInput');
+    const board = getActiveBoard();
+    if (board && input) {
+        input.value = `${window.location.origin}${window.location.pathname}?board=${encodeURIComponent(board.id)}`;
+    }
+    if (!input) return;
     input.select();
-    navigator.clipboard.writeText(input.value);
-    showToast('Link copied to clipboard!', 'success');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(input.value).then(() => {
+            showToast('Board link copied to clipboard! 📋', 'success');
+        }).catch(() => {
+            document.execCommand('copy');
+            showToast('Board link copied to clipboard! 📋', 'success');
+        });
+    } else {
+        document.execCommand('copy');
+        showToast('Board link copied to clipboard! 📋', 'success');
+    }
 }
 
 // ============================
@@ -2494,9 +2919,29 @@ async function toggleTheme(forced = null) {
     await apiCall('setTheme', { theme: newTheme });
 }
 
+function getTodayStr() {
+    const d = new Date();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function isFutureRecurringTask(task, todayStr = getTodayStr()) {
+    if (!task || !task.recurrence || task.recurrence === 'none') return false;
+    if (!task.due_date) return false;
+    return task.due_date > todayStr;
+}
+
+function isPastCompletedRecurringTask(task, todayStr = getTodayStr()) {
+    if (!task || !task.recurrence || task.recurrence === 'none') return false;
+    if (!task.due_date) return false;
+    return Boolean(task.completed) && task.due_date < todayStr;
+}
+
 function getDueInfo(task) {
     if (!task.due_date) return { label: null, isToday: false, isOverdue: false };
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayStr();
     const isToday = task.due_date === today;
     const isOverdue = !task.completed && task.due_date < today;
 
@@ -2573,23 +3018,27 @@ function showToast(msg, type = 'info') {
 }
 
 function getFilteredTasks(tasks) {
-    if (state.activeFilter === 'all') return tasks;
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayStr();
 
-    if (state.activeFilter === 'high') {
-        return tasks.filter(t => t.priority === 'high');
+    // Future recurring tasks should not be shown on today's active board - they will show when their due date arrives
+    const nonFuture = tasks.filter(t => !isFutureRecurringTask(t, today));
+
+    if (state.activeFilter === 'all') {
+        return nonFuture.filter(t => !isPastCompletedRecurringTask(t, today));
+    } else if (state.activeFilter === 'high') {
+        return nonFuture.filter(t => t.priority === 'high' && !isPastCompletedRecurringTask(t, today));
     } else if (state.activeFilter === 'medium') {
-        return tasks.filter(t => t.priority === 'medium');
+        return nonFuture.filter(t => t.priority === 'medium' && !isPastCompletedRecurringTask(t, today));
     } else if (state.activeFilter === 'low') {
-        return tasks.filter(t => t.priority === 'low');
+        return nonFuture.filter(t => t.priority === 'low' && !isPastCompletedRecurringTask(t, today));
     } else if (state.activeFilter === 'today') {
         return tasks.filter(t => t.due_date === today);
     } else if (state.activeFilter === 'my-tasks') {
-        return tasks.filter(t => t.assigned_to && t.assigned_to === state.currentUserId);
+        return nonFuture.filter(t => t.assigned_to && t.assigned_to === state.currentUserId && !isPastCompletedRecurringTask(t, today));
     } else if (state.activeFilter === 'completed') {
         return tasks.filter(t => t.completed);
     }
-    return tasks;
+    return nonFuture;
 }
 
 function renderEmptyState() {
@@ -2721,7 +3170,7 @@ function setupEventListeners() {
         if (state.activeBoardId) deleteBoard(state.activeBoardId);
     });
 
-    // Share Board
+    // Share Board & General Access (Google Drive style)
     document.getElementById('shareBoardBtn')?.addEventListener('click', openShareModal);
     document.getElementById('boardMemberStack')?.addEventListener('click', openShareModal);
     document.getElementById('shareModalClose')?.addEventListener('click', closeShareModal);
@@ -2729,6 +3178,57 @@ function setupEventListeners() {
     document.getElementById('copyShareLinkBtn')?.addEventListener('click', copyShareLink);
     document.getElementById('inviteBtn')?.addEventListener('click', inviteMember);
     document.getElementById('inviteEmail')?.addEventListener('keydown', e => { if (e.key === 'Enter') inviteMember(); });
+
+    document.getElementById('generalAccessSelect')?.addEventListener('change', async e => {
+        const board = getActiveBoard();
+        if (!board || !board.is_owner) return;
+        const generalAccess = e.target.value;
+        const linkRole = document.getElementById('linkRoleSelect')?.value || 'editor';
+        updateGeneralAccessUI(generalAccess, linkRole);
+        const res = await apiCall('updateBoardGeneralAccess', { boardId: board.id, generalAccess, linkRole });
+        if (res.success) {
+            state.boards = res.boards;
+            renderBoard();
+            showToast('Updated general access settings', 'success');
+        }
+    });
+
+    document.getElementById('linkRoleSelect')?.addEventListener('change', async e => {
+        const board = getActiveBoard();
+        if (!board || !board.is_owner) return;
+        const linkRole = e.target.value;
+        const generalAccess = document.getElementById('generalAccessSelect')?.value || 'anyone_with_link';
+        updateGeneralAccessUI(generalAccess, linkRole);
+        const res = await apiCall('updateBoardGeneralAccess', { boardId: board.id, generalAccess, linkRole });
+        if (res.success) {
+            state.boards = res.boards;
+            renderBoard();
+            showToast(`Link permission updated to ${linkRole}`, 'success');
+        }
+    });
+
+    // Request Access Screen actions
+    document.getElementById('reqAccSubmitBtn')?.addEventListener('click', async () => {
+        const boardId = state.pendingRequestBoardId;
+        if (!boardId) return;
+        const message = document.getElementById('reqAccMessage')?.value.trim() || '';
+        const btn = document.getElementById('reqAccSubmitBtn');
+        btn.disabled = true;
+        btn.textContent = 'Sending request...';
+        const res = await apiCall('requestBoardAccess', { boardId, message });
+        btn.disabled = false;
+        btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> Request access`;
+        if (res.success) {
+            document.getElementById('reqAccForm').style.display = 'none';
+            document.getElementById('reqAccStatus').style.display = '';
+            showToast('Access request sent to the board owner! 📬', 'success');
+        } else {
+            showToast(res.error || 'Failed to send request', 'error');
+        }
+    });
+
+    document.getElementById('reqAccCancelBtn')?.addEventListener('click', () => setView('dashboard'));
+    document.getElementById('reqAccBackBtn')?.addEventListener('click', () => setView('dashboard'));
 
     // Boards Accordion
     document.getElementById('boardsToggle')?.addEventListener('click', () => {
@@ -2959,6 +3459,11 @@ function setupEventListeners() {
         e.preventDefault();
         openCommandPalette();
     });
+
+    // Activity Log view navigation triggers
+    document.getElementById('dashViewAllActivityBtn')?.addEventListener('click', () => setView('activity'));
+    document.getElementById('dashViewAllActivityFooterBtn')?.addEventListener('click', () => setView('activity'));
+    document.getElementById('activityBackBtn')?.addEventListener('click', () => setView('dashboard'));
 
     // Modal background click dismiss
     ['taskModal', 'boardModal', 'listModal', 'shareModal', 'commandPalette', 'shortcutsModal', 'settingsModal'].forEach(id => {

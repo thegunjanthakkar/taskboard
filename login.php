@@ -1,12 +1,16 @@
 <?php
 session_start();
 
+$targetBoard = !empty($_GET['board']) ? trim($_GET['board']) : '';
+$redirectUrl = 'index.php' . ($targetBoard ? '?board=' . urlencode($targetBoard) : '');
+
 if (isset($_SESSION['auth_user'])) {
-    header('Location: index.php');
+    header('Location: ' . $redirectUrl);
     exit;
 }
 
 $theme = 'dark';
+$googleHref = 'google_login.php' . ($targetBoard ? '?board=' . urlencode($targetBoard) : '');
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="<?= $theme ?>">
@@ -21,7 +25,7 @@ $theme = 'dark';
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css?v=<?= filemtime(__DIR__ . '/style.css') ?>">
 </head>
-<body class="auth-page" data-auth-redirect="index.php">
+<body class="auth-page" data-auth-redirect="<?= htmlspecialchars($redirectUrl) ?>">
     <main class="auth-shell">
         <section class="auth-card" aria-label="Login form">
             <div class="auth-brand">
@@ -70,7 +74,7 @@ $theme = 'dark';
             </div>
 
             <div class="auth-divider">or</div>
-            <a href="google_login.php" class="btn auth-google">Continue with Google</a>
+            <a href="<?= htmlspecialchars($googleHref) ?>" class="btn auth-google">Continue with Google</a>
             <div id="authMessage" class="auth-message"></div>
         </section>
     </main>

@@ -220,6 +220,23 @@ function ensureSchema(PDO $pdo): void
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ");
 
+    // 10. board_access_requests
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `board_access_requests` (
+          `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+          `board_id` VARCHAR(64) NOT NULL,
+          `user_id` INT UNSIGNED NOT NULL,
+          `message` TEXT NULL,
+          `status` ENUM('pending','approved','declined') NOT NULL DEFAULT 'pending',
+          `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+          `updated_at` DATETIME NULL,
+          PRIMARY KEY (`id`),
+          UNIQUE KEY `uq_bar_board_user` (`board_id`, `user_id`),
+          KEY `idx_bar_board` (`board_id`),
+          KEY `idx_bar_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
     // Ensure columns in `boards`
     try {
         $c = $pdo->query("SHOW COLUMNS FROM `boards` LIKE 'color'")->fetch();
@@ -232,6 +249,14 @@ function ensureSchema(PDO $pdo): void
     try {
         $c = $pdo->query("SHOW COLUMNS FROM `boards` LIKE 'is_archived'")->fetch();
         if (!$c) $pdo->exec("ALTER TABLE `boards` ADD COLUMN `is_archived` TINYINT(1) NOT NULL DEFAULT 0, ADD KEY `idx_boards_archived` (`is_archived`)");
+    } catch (Exception $e) {}
+    try {
+        $c = $pdo->query("SHOW COLUMNS FROM `boards` LIKE 'general_access'")->fetch();
+        if (!$c) $pdo->exec("ALTER TABLE `boards` ADD COLUMN `general_access` VARCHAR(32) NOT NULL DEFAULT 'anyone_with_link'");
+    } catch (Exception $e) {}
+    try {
+        $c = $pdo->query("SHOW COLUMNS FROM `boards` LIKE 'link_role'")->fetch();
+        if (!$c) $pdo->exec("ALTER TABLE `boards` ADD COLUMN `link_role` VARCHAR(20) NOT NULL DEFAULT 'editor'");
     } catch (Exception $e) {}
 
     // Ensure columns in `board_lists`
@@ -271,6 +296,29 @@ function ensureSchema(PDO $pdo): void
     if (!is_dir($uploadDir)) {
         @mkdir($uploadDir, 0755, true);
     }
+
+    // Self-healing: Clean up runaway test chains of recurring tasks with future due dates
+    try {
+        // Reset any future recurring task that was prematurely marked completed to uncompleted if its due_date is tomorrow
+        $pdo->exec("
+            UPDATE tasks
+            SET completed = 0, completed_at = NULL
+            WHERE recurrence != 'none'
+              AND due_date = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+              AND completed = 1
+        ");
+
+        // Remove redundant chained duplicates that were spawned beyond tomorrow for the same list & title
+        $pdo->exec("
+            DELETE t1 FROM tasks t1
+            INNER JOIN tasks t2 ON t1.list_id = t2.list_id
+                                AND t1.title = t2.title
+                                AND t1.recurrence = t2.recurrence
+                                AND t1.recurrence != 'none'
+            WHERE t1.due_date > DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+              AND t2.due_date = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+        ");
+    } catch (Exception $e) {}
 }
 
 function logActivity(PDO $pdo, ?string $boardId, ?string $taskId, int $userId, string $action, ?string $details = null): void
@@ -280,6 +328,117 @@ function logActivity(PDO $pdo, ?string $boardId, ?string $taskId, int $userId, s
         $stmt->execute([$boardId, $taskId, $userId, $action, $details]);
     } catch (Exception $e) {
         // Non-fatal logging
+    }
+}
+
+function getActorName(PDO $pdo, int $actorId): string
+{
+    static $cache = [];
+    if (isset($cache[$actorId])) return $cache[$actorId];
+    try {
+        $stmt = $pdo->prepare('SELECT name, email FROM users WHERE id = ?');
+        $stmt->execute([$actorId]);
+        $u = $stmt->fetch();
+        $name = $u ? ($u['name'] ?: explode('@', $u['email'])[0]) : 'A collaborator';
+        $cache[$actorId] = $name;
+        return $name;
+    } catch (Exception $e) {
+        return 'A collaborator';
+    }
+}
+
+function getBoardName(PDO $pdo, string $boardId): string
+{
+    static $cache = [];
+    if (isset($cache[$boardId])) return $cache[$boardId];
+    try {
+        $stmt = $pdo->prepare('SELECT name FROM boards WHERE id = ?');
+        $stmt->execute([$boardId]);
+        $name = $stmt->fetchColumn() ?: 'Board';
+        $cache[$boardId] = $name;
+        return $name;
+    } catch (Exception $e) {
+        return 'Board';
+    }
+}
+
+function sendPushNotification(PDO $pdo, int $targetUserId, string $title, ?string $message = null, ?string $url = null): void
+{
+    try {
+        if (!file_exists(__DIR__ . '/vapid.php')) return;
+        $config = require __DIR__ . '/vapid.php';
+        if (empty($config['publicKey']) || empty($config['privateKey'])) return;
+
+        $autoloads = [
+            __DIR__ . '/vendor/autoload.php',
+            __DIR__ . '/web-push-php-master/web-push-php-master/vendor/autoload.php',
+            __DIR__ . '/web-push-php-master/vendor/autoload.php',
+        ];
+        $loaded = false;
+        foreach ($autoloads as $al) {
+            if (file_exists($al)) { require_once $al; $loaded = true; break; }
+        }
+        if (!$loaded) {
+            $srcDirs = [
+                __DIR__ . '/web-push-php-master/web-push-php-master/src',
+                __DIR__ . '/web-push-php-master/src',
+            ];
+            foreach ($srcDirs as $src) {
+                if (is_dir($src)) {
+                    spl_autoload_register(function (string $class) use ($src) {
+                        $prefix = 'Minishlink\\WebPush\\';
+                        if (strpos($class, $prefix) !== 0) return;
+                        $rel  = str_replace('\\', '/', substr($class, strlen($prefix)));
+                        $file = $src . '/' . $rel . '.php';
+                        if (file_exists($file)) require_once $file;
+                    });
+                    $loaded = true;
+                    break;
+                }
+            }
+        }
+        if (!$loaded || !class_exists('Minishlink\\WebPush\\WebPush')) return;
+
+        $subsStmt = $pdo->prepare('SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?');
+        $subsStmt->execute([$targetUserId]);
+        $subs = $subsStmt->fetchAll();
+        if (empty($subs)) return;
+
+        $webPush = new \Minishlink\WebPush\WebPush([
+            'VAPID' => [
+                'subject' => $config['subject'],
+                'publicKey' => $config['publicKey'],
+                'privateKey' => $config['privateKey'],
+            ]
+        ]);
+
+        $payload = json_encode([
+            'title' => $title,
+            'body' => $message ?: '',
+            'tag' => 'tb-' . time(),
+            'url' => $url ?: './',
+        ]);
+
+        foreach ($subs as $s) {
+            try {
+                $sub = \Minishlink\WebPush\Subscription::create([
+                    'endpoint' => $s['endpoint'],
+                    'keys' => [
+                        'p256dh' => $s['p256dh'],
+                        'auth' => $s['auth'],
+                    ]
+                ]);
+                $webPush->queueNotification($sub, $payload);
+            } catch (Exception $e) {}
+        }
+
+        foreach ($webPush->flush() as $report) {
+            if (!$report->isSuccess() && $report->getResponse() && in_array($report->getResponse()->getStatusCode(), [404, 410])) {
+                $pdo->prepare('DELETE FROM push_subscriptions WHERE endpoint = ?')->execute([$report->getRequest()->getUri()->__toString()]);
+            }
+        }
+    } catch (Throwable $e) {
+        // Non-fatal push failure
     }
 }
 
@@ -293,6 +452,40 @@ function createNotification(PDO $pdo, int $targetUserId, ?int $actorId, string $
         $id = genId('notif');
         $stmt = $pdo->prepare('INSERT INTO notifications (id, user_id, actor_id, type, title, message, entity_type, entity_id, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW())');
         $stmt->execute([$id, $targetUserId, $actorId, $type, $title, $message, $entityType, $entityId]);
+
+        // Background Web Push to recipient if subscribed
+        sendPushNotification($pdo, $targetUserId, $title, $message);
+    } catch (Exception $e) {
+        // Non-fatal
+    }
+}
+
+function notifyBoardMembers(PDO $pdo, string $boardId, int $actorId, string $type, string $title, ?string $message = null, ?string $entityType = null, ?string $entityId = null): void
+{
+    try {
+        $stmtOwner = $pdo->prepare('SELECT user_id FROM boards WHERE id = ?');
+        $stmtOwner->execute([$boardId]);
+        $ownerId = (int) $stmtOwner->fetchColumn();
+
+        $targetUserIds = [];
+        if ($ownerId && $ownerId !== $actorId) {
+            $targetUserIds[] = $ownerId;
+        }
+
+        $stmtMembers = $pdo->prepare('SELECT user_id FROM board_members WHERE board_id = ?');
+        $stmtMembers->execute([$boardId]);
+        foreach ($stmtMembers->fetchAll() as $row) {
+            $mId = (int) $row['user_id'];
+            if ($mId && $mId !== $actorId && !in_array($mId, $targetUserIds, true)) {
+                $targetUserIds[] = $mId;
+            }
+        }
+
+        if (empty($targetUserIds)) return;
+
+        foreach ($targetUserIds as $targetUserId) {
+            createNotification($pdo, $targetUserId, $actorId, $type, $title, $message, $entityType, $entityId);
+        }
     } catch (Exception $e) {
         // Non-fatal
     }
@@ -388,6 +581,8 @@ function fetchBoards(PDO $pdo, int $userId, bool $includeArchived = false): arra
 
     $boardsStmt = $pdo->prepare("
         SELECT DISTINCT b.id, b.name, b.color, b.icon, b.position, b.is_archived, b.created_at,
+               COALESCE(b.general_access, 'anyone_with_link') AS general_access,
+               COALESCE(b.link_role, 'editor') AS link_role,
                b.user_id AS owner_id, u.email AS owner_email, u.name AS owner_name,
                CASE WHEN b.user_id = ? THEN 'owner' ELSE COALESCE(bm.role, 'editor') END AS user_role
         FROM boards b
@@ -405,6 +600,30 @@ function fetchBoards(PDO $pdo, int $userId, bool $includeArchived = false): arra
 
     $boardIds = array_column($boardsData, 'id');
     $inPlaceholder = implode(',', array_fill(0, count($boardIds), '?'));
+
+    // Fetch pending access requests for owned boards
+    $requestsByBoard = [];
+    try {
+        $reqStmt = $pdo->prepare("
+            SELECT bar.id, bar.board_id, bar.user_id, bar.message, bar.created_at,
+                   u.name AS user_name, u.email AS user_email
+            FROM board_access_requests bar
+            INNER JOIN users u ON u.id = bar.user_id
+            WHERE bar.board_id IN ($inPlaceholder) AND bar.status = 'pending'
+            ORDER BY bar.created_at DESC
+        ");
+        $reqStmt->execute($boardIds);
+        foreach ($reqStmt->fetchAll() as $reqRow) {
+            $requestsByBoard[$reqRow['board_id']][] = [
+                'id' => (int) $reqRow['id'],
+                'user_id' => (int) $reqRow['user_id'],
+                'user_name' => $reqRow['user_name'] ?: explode('@', $reqRow['user_email'])[0],
+                'user_email' => $reqRow['user_email'],
+                'message' => $reqRow['message'],
+                'created_at' => $reqRow['created_at']
+            ];
+        }
+    } catch (Exception $e) {}
 
     // Fetch members for each board
     $memStmt = $pdo->prepare("
@@ -565,8 +784,12 @@ function fetchBoards(PDO $pdo, int $userId, bool $includeArchived = false): arra
             'color' => $boardRow['color'] ?? '#4f8ef7',
             'icon' => $boardRow['icon'] ?? 'grid',
             'is_archived' => (bool) $boardRow['is_archived'],
+            'general_access' => $boardRow['general_access'] ?? 'anyone_with_link',
+            'link_role' => $boardRow['link_role'] ?? 'editor',
+            'access_requests' => $requestsByBoard[$boardRow['id']] ?? [],
             'owner_id' => $ownerId,
             'owner_email' => $boardRow['owner_email'],
+            'owner_name' => $boardRow['owner_name'] ?: explode('@', $boardRow['owner_email'])[0],
             'is_owner' => ($ownerId === $userId),
             'user_role' => $boardRow['user_role'],
             'created_at' => $boardRow['created_at'],
@@ -631,11 +854,11 @@ try {
             // 1. Overall counts
             $stmt = $pdo->prepare("
                 SELECT 
-                    COUNT(CASE WHEN t.completed = 0 THEN 1 END) AS active_count,
+                    COUNT(CASE WHEN t.completed = 0 AND (t.recurrence = 'none' OR t.due_date IS NULL OR t.due_date <= CURDATE()) THEN 1 END) AS active_count,
                     COUNT(CASE WHEN t.completed = 0 AND t.due_date = CURDATE() THEN 1 END) AS due_today_count,
                     COUNT(CASE WHEN t.completed = 1 AND DATE(t.completed_at) = CURDATE() THEN 1 END) AS completed_today_count,
                     COUNT(CASE WHEN t.completed = 0 AND t.due_date < CURDATE() THEN 1 END) AS overdue_count,
-                    COUNT(*) AS total_count,
+                    COUNT(CASE WHEN t.recurrence = 'none' OR t.due_date IS NULL OR t.due_date <= CURDATE() THEN 1 END) AS total_count,
                     COUNT(CASE WHEN t.completed = 1 THEN 1 END) AS completed_count
                 FROM tasks t
                 INNER JOIN board_lists l ON l.id = t.list_id
@@ -672,7 +895,7 @@ try {
             $stmtUpcoming->execute(array_merge($boardIds, [$sevenDays]));
             $upcomingTasks = $stmtUpcoming->fetchAll();
 
-            // 3. Recent activity feed
+            // 3. Recent activity feed (strictly for this user - other users cannot see each other's activity)
             $stmtAct = $pdo->prepare("
                 SELECT a.id, a.board_id, a.task_id, a.action, a.details, a.created_at,
                        u.name AS user_name, u.email AS user_email,
@@ -681,11 +904,11 @@ try {
                 LEFT JOIN users u ON u.id = a.user_id
                 LEFT JOIN boards b ON b.id = a.board_id
                 LEFT JOIN tasks t ON t.id = a.task_id
-                WHERE a.board_id IN ($inPlaceholder)
+                WHERE a.user_id = ? AND (a.board_id IN ($inPlaceholder) OR a.board_id IS NULL)
                 ORDER BY a.created_at DESC
                 LIMIT 15
             ");
-            $stmtAct->execute($boardIds);
+            $stmtAct->execute(array_merge([$userId], $boardIds));
             $recentActivity = $stmtAct->fetchAll();
         } else {
             $recentActivity = [];
@@ -710,6 +933,49 @@ try {
                 'name' => $authUser['name'] ?? explode('@', $authUser['email'])[0]
             ]
         ]);
+        break;
+    }
+
+    case 'getAllActivity': {
+        $boards = fetchBoards($pdo, $userId, false);
+        $boardIds = array_column($boards, 'id');
+
+        if (empty($boardIds)) {
+            $stmtAct = $pdo->prepare("
+                SELECT a.id, a.board_id, a.task_id, a.action, a.details, a.created_at,
+                       u.name AS user_name, u.email AS user_email,
+                       b.name AS board_name, b.color AS board_color, t.title AS task_title
+                FROM activity_logs a
+                LEFT JOIN users u ON u.id = a.user_id
+                LEFT JOIN boards b ON b.id = a.board_id
+                LEFT JOIN tasks t ON t.id = a.task_id
+                WHERE a.user_id = ?
+                ORDER BY a.created_at DESC
+                LIMIT 100
+            ");
+            $stmtAct->execute([$userId]);
+            $activity = $stmtAct->fetchAll();
+            echo json_encode(['success' => true, 'activity' => $activity]);
+            break;
+        }
+
+        $inPlaceholder = implode(',', array_fill(0, count($boardIds), '?'));
+        $stmtAct = $pdo->prepare("
+            SELECT a.id, a.board_id, a.task_id, a.action, a.details, a.created_at,
+                   u.name AS user_name, u.email AS user_email,
+                   b.name AS board_name, b.color AS board_color, t.title AS task_title
+            FROM activity_logs a
+            LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN boards b ON b.id = a.board_id
+            LEFT JOIN tasks t ON t.id = a.task_id
+            WHERE a.user_id = ? AND (a.board_id IN ($inPlaceholder) OR a.board_id IS NULL)
+            ORDER BY a.created_at DESC
+            LIMIT 100
+        ");
+        $stmtAct->execute(array_merge([$userId], $boardIds));
+        $activity = $stmtAct->fetchAll();
+
+        echo json_encode(['success' => true, 'activity' => $activity]);
         break;
     }
 
@@ -896,6 +1162,8 @@ try {
         $stmt->execute($params);
 
         logActivity($pdo, $boardId, null, $userId, 'board_updated', "Updated board details");
+        $actorName = getActorName($pdo, $userId);
+        notifyBoardMembers($pdo, $boardId, $userId, 'board_updated', "Board updated: '{$name}'", "{$actorName} updated board details", 'board', $boardId);
         echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         break;
     }
@@ -1032,6 +1300,9 @@ try {
         $stmt->execute([$listId, $boardId, $name, $color, $position]);
 
         logActivity($pdo, $boardId, null, $userId, 'list_created', "Created list '{$name}'");
+        $actorName = getActorName($pdo, $userId);
+        $boardName = getBoardName($pdo, $boardId);
+        notifyBoardMembers($pdo, $boardId, $userId, 'list_created', "New column in '{$boardName}'", "{$actorName} added column '{$name}'", 'board', $boardId);
         echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         break;
     }
@@ -1050,6 +1321,10 @@ try {
         $stmt = $pdo->prepare('UPDATE board_lists SET name = ?, color = COALESCE(?, color) WHERE id = ? AND board_id = ?');
         $stmt->execute([$name, $color, $listId, $boardId]);
 
+        logActivity($pdo, $boardId, null, $userId, 'list_renamed', "Renamed column to '{$name}'");
+        $actorName = getActorName($pdo, $userId);
+        $boardName = getBoardName($pdo, $boardId);
+        notifyBoardMembers($pdo, $boardId, $userId, 'list_renamed', "Column renamed in '{$boardName}'", "{$actorName} renamed column to '{$name}'", 'board', $boardId);
         echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         break;
     }
@@ -1062,9 +1337,17 @@ try {
             break;
         }
 
+        $colNameStmt = $pdo->prepare('SELECT name FROM board_lists WHERE id = ? AND board_id = ?');
+        $colNameStmt->execute([$listId, $boardId]);
+        $listName = $colNameStmt->fetchColumn() ?: 'column';
+
         $stmt = $pdo->prepare('DELETE FROM board_lists WHERE id = ? AND board_id = ?');
         $stmt->execute([$listId, $boardId]);
 
+        logActivity($pdo, $boardId, null, $userId, 'list_deleted', "Deleted column '{$listName}'");
+        $actorName = getActorName($pdo, $userId);
+        $boardName = getBoardName($pdo, $boardId);
+        notifyBoardMembers($pdo, $boardId, $userId, 'list_deleted', "Column removed from '{$boardName}'", "{$actorName} deleted column '{$listName}'", 'board', $boardId);
         echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         break;
     }
@@ -1129,6 +1412,10 @@ try {
             if ($assignedTo && $assignedTo !== $userId) {
                 createNotification($pdo, $assignedTo, $userId, 'assigned', "Assigned to '{$title}'", "You were assigned to task '{$title}'", 'task', $newTaskId);
             }
+
+            $actorName = getActorName($pdo, $userId);
+            $boardName = getBoardName($pdo, $boardId);
+            notifyBoardMembers($pdo, $boardId, $userId, 'task_created', "New task in '{$boardName}'", "{$actorName} added task '{$title}'", 'task', $newTaskId);
 
             $pdo->commit();
         } catch (Throwable $e) {
@@ -1200,6 +1487,9 @@ try {
         }
 
         logActivity($pdo, $boardId, $taskId, $userId, 'task_updated', "Updated task '{$title}'");
+        $actorName = getActorName($pdo, $userId);
+        $boardName = getBoardName($pdo, $boardId);
+        notifyBoardMembers($pdo, $boardId, $userId, 'task_updated', "Task updated in '{$boardName}'", "{$actorName} updated '{$title}'", 'task', $taskId);
         echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         break;
     }
@@ -1211,6 +1501,10 @@ try {
             echo json_encode(['success' => false, 'error' => 'Permission denied']);
             break;
         }
+
+        $taskTitleStmt = $pdo->prepare('SELECT title FROM tasks WHERE id = ?');
+        $taskTitleStmt->execute([$taskId]);
+        $taskTitle = $taskTitleStmt->fetchColumn() ?: 'task';
 
         // Delete any attachment files physically
         $attStmt = $pdo->prepare('SELECT filename FROM attachments WHERE task_id = ?');
@@ -1228,6 +1522,9 @@ try {
         $stmt->execute([$taskId, $boardId]);
 
         logActivity($pdo, $boardId, null, $userId, 'task_deleted', "Deleted task");
+        $actorName = getActorName($pdo, $userId);
+        $boardName = getBoardName($pdo, $boardId);
+        notifyBoardMembers($pdo, $boardId, $userId, 'task_deleted', "Task deleted from '{$boardName}'", "{$actorName} deleted task '{$taskTitle}'", 'board', $boardId);
         echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         break;
     }
@@ -1274,45 +1571,62 @@ try {
                         break;
                 }
                 $nextDueDate = $currentDue->format('Y-m-d');
-                $nextTaskId = genId('task');
-                $nextPos = nextPosition($pdo, 'tasks', 'position', 'list_id', $task['list_id']);
 
-                // Insert recurring next occurrence
-                $insRec = $pdo->prepare('INSERT INTO tasks (id, list_id, title, description, start_date, due_date, due_time, priority, completed, position, assigned_to, recurrence, recurrence_interval, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?, ?, NOW())');
-                $insRec->execute([
-                    $nextTaskId,
-                    $task['list_id'],
-                    $task['title'],
-                    $task['description'],
-                    $nextDueDate,
-                    $task['due_time'],
-                    $task['priority'],
-                    $nextPos,
-                    $task['assigned_to'],
-                    $task['recurrence'],
-                    $interval
-                ]);
+                // Check if an uncompleted next occurrence already exists on/after nextDueDate
+                $chkNext = $pdo->prepare('SELECT id FROM tasks WHERE list_id = ? AND title = ? AND recurrence = ? AND completed = 0 AND due_date >= ? AND is_archived = 0 LIMIT 1');
+                $chkNext->execute([$task['list_id'], $task['title'], $task['recurrence'], $nextDueDate]);
+                $existingNextId = $chkNext->fetchColumn();
 
-                // Copy labels
-                $tlStmt = $pdo->prepare('SELECT label_id FROM task_labels WHERE task_id = ?');
-                $tlStmt->execute([$taskId]);
-                $insTl = $pdo->prepare('INSERT INTO task_labels (task_id, label_id) VALUES (?, ?)');
-                foreach ($tlStmt->fetchAll() as $tl) {
-                    $insTl->execute([$nextTaskId, $tl['label_id']]);
+                if (!$existingNextId) {
+                    $nextTaskId = genId('task');
+                    $nextPos = nextPosition($pdo, 'tasks', 'position', 'list_id', $task['list_id']);
+
+                    // Insert recurring next occurrence
+                    $insRec = $pdo->prepare('INSERT INTO tasks (id, list_id, title, description, start_date, due_date, due_time, priority, completed, position, assigned_to, recurrence, recurrence_interval, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?, ?, NOW())');
+                    $insRec->execute([
+                        $nextTaskId,
+                        $task['list_id'],
+                        $task['title'],
+                        $task['description'],
+                        $nextDueDate,
+                        $task['due_time'],
+                        $task['priority'],
+                        $nextPos,
+                        $task['assigned_to'],
+                        $task['recurrence'],
+                        $interval
+                    ]);
+
+                    // Copy labels
+                    $tlStmt = $pdo->prepare('SELECT label_id FROM task_labels WHERE task_id = ?');
+                    $tlStmt->execute([$taskId]);
+                    $insTl = $pdo->prepare('INSERT INTO task_labels (task_id, label_id) VALUES (?, ?)');
+                    foreach ($tlStmt->fetchAll() as $tl) {
+                        $insTl->execute([$nextTaskId, $tl['label_id']]);
+                    }
+
+                    // Copy subtasks (reset completed = 0)
+                    $subStmt = $pdo->prepare('SELECT title, position FROM subtasks WHERE task_id = ? ORDER BY position ASC');
+                    $subStmt->execute([$taskId]);
+                    $insSub = $pdo->prepare('INSERT INTO subtasks (id, task_id, title, completed, position, created_at) VALUES (?, ?, ?, 0, ?, NOW())');
+                    foreach ($subStmt->fetchAll() as $s) {
+                        $insSub->execute([genId('sub'), $nextTaskId, $s['title'], $s['position']]);
+                    }
+
+                    logActivity($pdo, $boardId, $nextTaskId, $userId, 'recurring_renewed', "Next occurrence scheduled for {$nextDueDate}");
                 }
-
-                // Copy subtasks (reset completed = 0)
-                $subStmt = $pdo->prepare('SELECT title, position FROM subtasks WHERE task_id = ? ORDER BY position ASC');
-                $subStmt->execute([$taskId]);
-                $insSub = $pdo->prepare('INSERT INTO subtasks (id, task_id, title, completed, position, created_at) VALUES (?, ?, ?, 0, ?, NOW())');
-                foreach ($subStmt->fetchAll() as $s) {
-                    $insSub->execute([genId('sub'), $nextTaskId, $s['title'], $s['position']]);
-                }
-
-                logActivity($pdo, $boardId, $nextTaskId, $userId, 'recurring_renewed', "Next occurrence scheduled for {$nextDueDate}");
+            } elseif ($newCompleted === 0 && $task['recurrence'] && $task['recurrence'] !== 'none') {
+                // If reopening a recurring task, remove any uncompleted future occurrence spawned from it
+                $cleanDate = $task['due_date'] ?: date('Y-m-d');
+                $delFuture = $pdo->prepare('DELETE FROM tasks WHERE list_id = ? AND title = ? AND recurrence = ? AND completed = 0 AND due_date > ? AND is_archived = 0');
+                $delFuture->execute([$task['list_id'], $task['title'], $task['recurrence'], $cleanDate]);
             }
 
             logActivity($pdo, $boardId, $taskId, $userId, $newCompleted ? 'task_completed' : 'task_reopened', $task['title']);
+            $actorName = getActorName($pdo, $userId);
+            $boardName = getBoardName($pdo, $boardId);
+            $statusStr = $newCompleted ? 'completed' : 'reopened';
+            notifyBoardMembers($pdo, $boardId, $userId, $newCompleted ? 'task_completed' : 'task_reopened', "Task {$statusStr} in '{$boardName}'", "{$actorName} marked '{$task['title']}' as {$statusStr}", 'task', $taskId);
             $pdo->commit();
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();
@@ -1357,6 +1671,17 @@ try {
                 $updStmt->execute([$targetListId, $pos + 1, $sId]);
             }
 
+            $stmtInfo = $pdo->prepare('SELECT t.title, l.name AS list_name, b.name AS board_name FROM tasks t INNER JOIN board_lists l ON l.id = ? INNER JOIN boards b ON b.id = ? WHERE t.id = ?');
+            $stmtInfo->execute([$targetListId, $boardId, $taskId]);
+            $rowInfo = $stmtInfo->fetch();
+            $tTitle = $rowInfo['title'] ?? 'Task';
+            $lName = $rowInfo['list_name'] ?? 'column';
+            $bName = $rowInfo['board_name'] ?? 'board';
+            $actorName = getActorName($pdo, $userId);
+
+            logActivity($pdo, $boardId, $taskId, $userId, 'task_moved', "Moved '{$tTitle}' to '{$lName}'");
+            notifyBoardMembers($pdo, $boardId, $userId, 'task_moved', "Task moved in '{$bName}'", "{$actorName} moved '{$tTitle}' to {$lName}", 'task', $taskId);
+
             $pdo->commit();
             echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
         } catch (Exception $e) {
@@ -1390,6 +1715,15 @@ try {
             foreach ($listIds as $pos => $lId) {
                 $updStmt->execute([$pos + 1, $lId]);
             }
+
+            $colNameStmt = $pdo->prepare('SELECT name FROM board_lists WHERE id = ?');
+            $colNameStmt->execute([$listId]);
+            $lName = $colNameStmt->fetchColumn() ?: 'column';
+            $actorName = getActorName($pdo, $userId);
+            $boardName = getBoardName($pdo, $boardId);
+
+            logActivity($pdo, $boardId, null, $userId, 'list_moved', "Reordered columns in '{$boardName}'");
+            notifyBoardMembers($pdo, $boardId, $userId, 'list_moved', "Columns reordered in '{$boardName}'", "{$actorName} moved column '{$lName}'", 'board', $boardId);
 
             $pdo->commit();
             echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
@@ -1439,6 +1773,22 @@ try {
         $bLabelsStmt = $pdo->prepare('SELECT id, name, color FROM labels WHERE board_id = ? OR (board_id IS NULL AND user_id = ?) ORDER BY name ASC');
         $bLabelsStmt->execute([$task['board_id'], $userId]);
         $allBoardLabels = $bLabelsStmt->fetchAll();
+
+        if (empty($allBoardLabels)) {
+            $defaultLabels = [
+                ['Bug', '#ef4444'],
+                ['Feature', '#4f8ef7'],
+                ['Urgent', '#f59e0b'],
+                ['Design', '#a855f7'],
+                ['Task', '#10b981'],
+            ];
+            $insLbl = $pdo->prepare('INSERT INTO labels (id, board_id, user_id, name, color, created_at) VALUES (?, ?, ?, ?, ?, NOW())');
+            foreach ($defaultLabels as $dl) {
+                $insLbl->execute([genId('lbl'), $task['board_id'], $userId, $dl[0], $dl[1]]);
+            }
+            $bLabelsStmt->execute([$task['board_id'], $userId]);
+            $allBoardLabels = $bLabelsStmt->fetchAll();
+        }
 
         // Comments
         $cmtStmt = $pdo->prepare("
@@ -1547,10 +1897,17 @@ try {
         $stmt->execute([$subId, $taskId, $title, $pos]);
 
         // Get board id for activity
-        $bStmt = $pdo->prepare('SELECT l.board_id FROM tasks t INNER JOIN board_lists l ON l.id = t.list_id WHERE t.id = ?');
+        $bStmt = $pdo->prepare('SELECT l.board_id, t.title FROM tasks t INNER JOIN board_lists l ON l.id = t.list_id WHERE t.id = ?');
         $bStmt->execute([$taskId]);
-        $bId = $bStmt->fetchColumn() ?: null;
+        $tRow = $bStmt->fetch();
+        $bId = $tRow['board_id'] ?? null;
         logActivity($pdo, $bId, $taskId, $userId, 'subtask_added', "Added checklist item '{$title}'");
+
+        if ($bId && $tRow) {
+            $actorName = getActorName($pdo, $userId);
+            $bName = getBoardName($pdo, $bId);
+            notifyBoardMembers($pdo, $bId, $userId, 'subtask_added', "Checklist updated in '{$bName}'", "{$actorName} added item '{$title}' to '{$tRow['title']}'", 'task', $taskId);
+        }
 
         $subs = $pdo->prepare('SELECT * FROM subtasks WHERE task_id = ? ORDER BY position ASC, created_at ASC');
         $subs->execute([$taskId]);
@@ -1569,6 +1926,17 @@ try {
         $sub = $tStmt->fetch();
 
         if ($sub) {
+            $bStmt = $pdo->prepare('SELECT l.board_id, t.title FROM tasks t INNER JOIN board_lists l ON l.id = t.list_id WHERE t.id = ?');
+            $bStmt->execute([$sub['task_id']]);
+            $tRow = $bStmt->fetch();
+            if ($tRow) {
+                $actorName = getActorName($pdo, $userId);
+                $bName = getBoardName($pdo, $tRow['board_id']);
+                $subStatus = $sub['completed'] ? 'completed' : 'reopened';
+                logActivity($pdo, $tRow['board_id'], $sub['task_id'], $userId, 'subtask_toggled', "Marked '{$sub['title']}' {$subStatus}");
+                notifyBoardMembers($pdo, $tRow['board_id'], $userId, 'subtask_toggled', "Checklist updated in '{$bName}'", "{$actorName} marked '{$sub['title']}' as {$subStatus}", 'task', $sub['task_id']);
+            }
+
             $subs = $pdo->prepare('SELECT * FROM subtasks WHERE task_id = ? ORDER BY position ASC, created_at ASC');
             $subs->execute([$sub['task_id']]);
             echo json_encode(['success' => true, 'subtasks' => $subs->fetchAll()]);
@@ -1611,15 +1979,20 @@ try {
     }
 
     case 'toggleTaskLabel': {
-        $taskId = $body['taskId'] ?? '';
-        $labelId = $body['labelId'] ?? '';
+        $taskId = trim($body['taskId'] ?? '');
+        $labelId = trim($body['labelId'] ?? '');
+
+        if (!$taskId || !$labelId) {
+            echo json_encode(['success' => false, 'error' => 'Missing task or label ID']);
+            break;
+        }
 
         $check = $pdo->prepare('SELECT 1 FROM task_labels WHERE task_id = ? AND label_id = ?');
         $check->execute([$taskId, $labelId]);
         if ($check->fetch()) {
             $pdo->prepare('DELETE FROM task_labels WHERE task_id = ? AND label_id = ?')->execute([$taskId, $labelId]);
         } else {
-            $pdo->prepare('INSERT INTO task_labels (task_id, label_id) VALUES (?, ?)')->execute([$taskId, $labelId]);
+            $pdo->prepare('INSERT IGNORE INTO task_labels (task_id, label_id) VALUES (?, ?)')->execute([$taskId, $labelId]);
         }
 
         $tlStmt = $pdo->prepare('SELECT l.id, l.name, l.color FROM task_labels tl INNER JOIN labels l ON l.id = tl.label_id WHERE tl.task_id = ?');
@@ -1653,10 +2026,10 @@ try {
 
         logActivity($pdo, $task['board_id'], $taskId, $userId, 'comment_added', "Commented on '{$task['title']}'");
 
-        // If assigned to someone else, notify them
-        if (!empty($task['assigned_to']) && (int)$task['assigned_to'] !== $userId) {
-            createNotification($pdo, (int)$task['assigned_to'], $userId, 'comment', "New comment on '{$task['title']}'", substr($content, 0, 100), 'task', $taskId);
-        }
+        $actorName = getActorName($pdo, $userId);
+        $bName = getBoardName($pdo, $task['board_id']);
+        $preview = mb_substr($content, 0, 75);
+        notifyBoardMembers($pdo, $task['board_id'], $userId, 'comment_added', "New comment in '{$bName}'", "{$actorName} on '{$task['title']}': \"{$preview}\"", 'task', $taskId);
 
         // Return updated comments
         $cmtStmt = $pdo->prepare("
@@ -1773,10 +2146,17 @@ try {
             $file['type'] ?: 'application/octet-stream'
         ]);
 
-        $bStmt = $pdo->prepare('SELECT l.board_id FROM tasks t INNER JOIN board_lists l ON l.id = t.list_id WHERE t.id = ?');
+        $bStmt = $pdo->prepare('SELECT l.board_id, t.title FROM tasks t INNER JOIN board_lists l ON l.id = t.list_id WHERE t.id = ?');
         $bStmt->execute([$taskId]);
-        $bId = $bStmt->fetchColumn() ?: null;
+        $tRow = $bStmt->fetch();
+        $bId = $tRow['board_id'] ?? null;
         logActivity($pdo, $bId, $taskId, $userId, 'attachment_uploaded', "Attached '{$origName}'");
+
+        if ($bId && $tRow) {
+            $actorName = getActorName($pdo, $userId);
+            $bName = getBoardName($pdo, $bId);
+            notifyBoardMembers($pdo, $bId, $userId, 'attachment_uploaded', "New file in '{$bName}'", "{$actorName} attached '{$origName}' to '{$tRow['title']}'", 'task', $taskId);
+        }
 
         // Return updated attachments list
         $attStmt = $pdo->prepare("
@@ -1893,6 +2273,210 @@ try {
         break;
     }
 
+    // Collaboration: Join board via direct share link
+    case 'joinBoardByLink': {
+        $boardId = trim($body['boardId'] ?? '');
+        if (!$boardId) {
+            echo json_encode(['success' => false, 'error' => 'Board ID is required']);
+            break;
+        }
+
+        $bStmt = $pdo->prepare('SELECT b.id, b.name, b.user_id AS owner_id, b.is_archived, COALESCE(b.general_access, "anyone_with_link") AS general_access, COALESCE(b.link_role, "editor") AS link_role, u.name AS owner_name, u.email AS owner_email FROM boards b LEFT JOIN users u ON u.id = b.user_id WHERE b.id = ?');
+        $bStmt->execute([$boardId]);
+        $board = $bStmt->fetch();
+
+        if (!$board) {
+            echo json_encode(['success' => false, 'error' => 'Board not found or link is invalid']);
+            break;
+        }
+
+        if ((int)$board['is_archived'] === 1) {
+            echo json_encode(['success' => false, 'error' => 'This board has been archived']);
+            break;
+        }
+
+        $ownerId = (int) $board['owner_id'];
+        if ($ownerId === $userId) {
+            echo json_encode([
+                'success' => true,
+                'alreadyMember' => true,
+                'role' => 'owner',
+                'boardName' => $board['name'],
+                'boards' => fetchBoards($pdo, $userId)
+            ]);
+            break;
+        }
+
+        // Check if already a member
+        $mStmt = $pdo->prepare('SELECT role FROM board_members WHERE board_id = ? AND user_id = ?');
+        $mStmt->execute([$boardId, $userId]);
+        $existingRole = $mStmt->fetchColumn();
+
+        if ($existingRole) {
+            echo json_encode([
+                'success' => true,
+                'alreadyMember' => true,
+                'role' => $existingRole,
+                'boardName' => $board['name'],
+                'boards' => fetchBoards($pdo, $userId)
+            ]);
+            break;
+        }
+
+        $generalAccess = $board['general_access'] ?? 'anyone_with_link';
+        $linkRole = in_array(($board['link_role'] ?? 'editor'), ['editor', 'viewer'], true) ? $board['link_role'] : 'editor';
+
+        // Restricted mode: Require access approval like Google Drive
+        if ($generalAccess === 'restricted') {
+            $reqCheck = $pdo->prepare('SELECT status, created_at FROM board_access_requests WHERE board_id = ? AND user_id = ?');
+            $reqCheck->execute([$boardId, $userId]);
+            $req = $reqCheck->fetch();
+
+            echo json_encode([
+                'success' => false,
+                'restricted' => true,
+                'boardId' => $boardId,
+                'boardName' => $board['name'],
+                'ownerName' => $board['owner_name'] ?: explode('@', $board['owner_email'])[0],
+                'ownerEmail' => $board['owner_email'],
+                'hasRequested' => (bool) $req,
+                'requestStatus' => $req ? $req['status'] : null,
+                'error' => 'You need permission to access this board'
+            ]);
+            break;
+        }
+
+        // Anyone with link mode: auto-join
+        $insStmt = $pdo->prepare('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE role = role');
+        $insStmt->execute([$boardId, $userId, $linkRole]);
+
+        $joinerName = $authUser['name'] ?: explode('@', $authUser['email'])[0];
+        logActivity($pdo, $boardId, null, $userId, 'member_joined', "{$joinerName} joined via shared link ({$linkRole})");
+        createNotification($pdo, $ownerId, $userId, 'board_joined', "New Collaborator", "{$joinerName} joined your board '{$board['name']}' via shared link", 'board', $boardId);
+
+        echo json_encode([
+            'success' => true,
+            'alreadyMember' => false,
+            'role' => $linkRole,
+            'boardName' => $board['name'],
+            'boards' => fetchBoards($pdo, $userId)
+        ]);
+        break;
+    }
+
+    // Collaboration: Request access to a restricted board
+    case 'requestBoardAccess': {
+        $boardId = trim($body['boardId'] ?? '');
+        $message = trim($body['message'] ?? '');
+
+        $bStmt = $pdo->prepare('SELECT b.id, b.name, b.user_id AS owner_id, u.name AS owner_name, u.email AS owner_email FROM boards b LEFT JOIN users u ON u.id = b.user_id WHERE b.id = ?');
+        $bStmt->execute([$boardId]);
+        $board = $bStmt->fetch();
+
+        if (!$board) {
+            echo json_encode(['success' => false, 'error' => 'Board not found']);
+            break;
+        }
+
+        $ownerId = (int) $board['owner_id'];
+        if ($ownerId === $userId) {
+            echo json_encode(['success' => true, 'alreadyMember' => true]);
+            break;
+        }
+
+        $ins = $pdo->prepare('
+            INSERT INTO board_access_requests (board_id, user_id, message, status, created_at, updated_at)
+            VALUES (?, ?, ?, "pending", NOW(), NOW())
+            ON DUPLICATE KEY UPDATE message = VALUES(message), status = "pending", updated_at = NOW()
+        ');
+        $ins->execute([$boardId, $userId, $message]);
+
+        $requesterName = $authUser['name'] ?: explode('@', $authUser['email'])[0];
+        createNotification(
+            $pdo,
+            $ownerId,
+            $userId,
+            'access_request',
+            "Access Request for '{$board['name']}'",
+            "{$requesterName} requested access to board '{$board['name']}'" . ($message ? ": \"{$message}\"" : ""),
+            'board',
+            $boardId
+        );
+        logActivity($pdo, $boardId, null, $userId, 'access_requested', "{$requesterName} requested access");
+
+        echo json_encode(['success' => true, 'message' => 'Access request sent to board owner']);
+        break;
+    }
+
+    // Collaboration: Update general access and link role (Google Drive style)
+    case 'updateBoardGeneralAccess': {
+        $boardId = trim($body['boardId'] ?? '');
+        $generalAccess = in_array($body['generalAccess'] ?? '', ['anyone_with_link', 'restricted'], true) ? $body['generalAccess'] : 'anyone_with_link';
+        $linkRole = in_array($body['linkRole'] ?? '', ['editor', 'viewer'], true) ? $body['linkRole'] : 'editor';
+
+        $userRole = getBoardAccess($pdo, $userId, $boardId);
+        if ($userRole !== 'owner') {
+            echo json_encode(['success' => false, 'error' => 'Only the board owner can change access settings']);
+            break;
+        }
+
+        $stmt = $pdo->prepare('UPDATE boards SET general_access = ?, link_role = ? WHERE id = ?');
+        $stmt->execute([$generalAccess, $linkRole, $boardId]);
+
+        $desc = ($generalAccess === 'anyone_with_link') ? "Changed to Anyone with link ({$linkRole})" : "Changed to Restricted";
+        logActivity($pdo, $boardId, null, $userId, 'access_settings_changed', $desc);
+
+        echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
+        break;
+    }
+
+    // Collaboration: Owner approves or declines access request
+    case 'handleBoardAccessRequest': {
+        $boardId = trim($body['boardId'] ?? '');
+        $requestId = (int) ($body['requestId'] ?? 0);
+        $decision = ($body['action'] ?? '') === 'approve' ? 'approve' : 'decline';
+        $role = in_array($body['role'] ?? '', ['editor', 'viewer'], true) ? $body['role'] : 'editor';
+
+        $userRole = getBoardAccess($pdo, $userId, $boardId);
+        if ($userRole !== 'owner') {
+            echo json_encode(['success' => false, 'error' => 'Only the board owner can manage access requests']);
+            break;
+        }
+
+        $rStmt = $pdo->prepare('SELECT user_id FROM board_access_requests WHERE id = ? AND board_id = ?');
+        $rStmt->execute([$requestId, $boardId]);
+        $targetUserId = (int) $rStmt->fetchColumn();
+
+        if (!$targetUserId) {
+            echo json_encode(['success' => false, 'error' => 'Request not found']);
+            break;
+        }
+
+        $bNameStmt = $pdo->prepare('SELECT name FROM boards WHERE id = ?');
+        $bNameStmt->execute([$boardId]);
+        $bName = $bNameStmt->fetchColumn() ?: 'board';
+
+        if ($decision === 'approve') {
+            $upd = $pdo->prepare('UPDATE board_access_requests SET status = "approved", updated_at = NOW() WHERE id = ?');
+            $upd->execute([$requestId]);
+
+            $bmStmt = $pdo->prepare('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE role = VALUES(role)');
+            $bmStmt->execute([$boardId, $targetUserId, $role]);
+
+            createNotification($pdo, $targetUserId, $userId, 'access_approved', "Access Granted to '{$bName}'", "Your access request to '{$bName}' was approved as {$role}!", 'board', $boardId);
+            logActivity($pdo, $boardId, null, $userId, 'request_approved', "Approved access request as {$role}");
+        } else {
+            $upd = $pdo->prepare('UPDATE board_access_requests SET status = "declined", updated_at = NOW() WHERE id = ?');
+            $upd->execute([$requestId]);
+
+            createNotification($pdo, $targetUserId, $userId, 'access_declined', "Access Declined for '{$bName}'", "Your access request to '{$bName}' was declined.", 'board', $boardId);
+            logActivity($pdo, $boardId, null, $userId, 'request_declined', "Declined access request");
+        }
+
+        echo json_encode(['success' => true, 'boards' => fetchBoards($pdo, $userId)]);
+        break;
+    }
+
     // Collaboration: Add collaborator by email
     case 'addBoardMember': {
         $boardId = $body['boardId'] ?? '';
@@ -1910,14 +2494,14 @@ try {
             break;
         }
 
-        $stmt = $pdo->prepare('SELECT id FROM users WHERE email = ?');
+        $stmt = $pdo->prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)');
         $stmt->execute([$email]);
         $targetUserId = $stmt->fetchColumn();
 
         if (!$targetUserId) {
             $stmt = $pdo->prepare('INSERT INTO users (email, name, created_at) VALUES (?, ?, NOW())');
             $stmt->execute([$email, explode('@', $email)[0]]);
-            $targetUserId = $pdo->lastInsertId();
+            $targetUserId = (int) $pdo->lastInsertId();
         } else {
             $targetUserId = (int) $targetUserId;
         }

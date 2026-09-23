@@ -27,11 +27,25 @@ if ($action === 'signup') {
     }
 
     // check exists
-    $stmt = $pdo->prepare('SELECT id FROM users WHERE email = ?');
+    $stmt = $pdo->prepare('SELECT id, password_hash FROM users WHERE LOWER(email) = LOWER(?)');
     $stmt->execute([$email]);
-    if ($stmt->fetch()) {
-        http_response_code(409);
-        echo json_encode(['error' => 'email_exists']);
+    $existing = $stmt->fetch();
+    if ($existing) {
+        if (!empty($existing['password_hash'])) {
+            http_response_code(409);
+            echo json_encode(['error' => 'email_exists']);
+            exit;
+        }
+        // User was pre-invited to a board! Activate their account by setting password
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+        $defaultName = explode('@', $email)[0];
+        $uStmt = $pdo->prepare('UPDATE users SET password_hash = ?, name = COALESCE(NULLIF(name, ""), ?) WHERE id = ?');
+        $uStmt->execute([$hash, $defaultName, (int)$existing['id']]);
+        $userId = (int) $existing['id'];
+
+        $_SESSION['auth_user'] = ['id' => $userId, 'email' => $email, 'name' => $defaultName];
+        $_SESSION['user_id'] = 'user_' . $userId;
+        echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
         exit;
     }
 
@@ -39,7 +53,7 @@ if ($action === 'signup') {
     $defaultName = explode('@', $email)[0];
     $stmt = $pdo->prepare('INSERT INTO users (email, password_hash, name, created_at) VALUES (?, ?, ?, NOW())');
     $stmt->execute([$email, $hash, $defaultName]);
-    $userId = $pdo->lastInsertId();
+    $userId = (int) $pdo->lastInsertId();
 
     $_SESSION['auth_user'] = ['id' => $userId, 'email' => $email, 'name' => $defaultName];
     $_SESSION['user_id'] = 'user_' . $userId;
@@ -55,7 +69,7 @@ if ($action === 'signup') {
         exit;
     }
 
-    $stmt = $pdo->prepare('SELECT id, name, password_hash FROM users WHERE email = ?');
+    $stmt = $pdo->prepare('SELECT id, name, password_hash FROM users WHERE LOWER(email) = LOWER(?)');
     $stmt->execute([$email]);
     $row = $stmt->fetch();
     if (!$row || !password_verify($password, $row['password_hash'])) {
@@ -65,7 +79,7 @@ if ($action === 'signup') {
     }
 
     $name = $row['name'] ?: explode('@', $email)[0];
-    $_SESSION['auth_user'] = ['id' => $row['id'], 'email' => $email, 'name' => $name];
+    $_SESSION['auth_user'] = ['id' => (int) $row['id'], 'email' => $email, 'name' => $name];
     $_SESSION['user_id'] = 'user_' . $row['id'];
     echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
     exit;
