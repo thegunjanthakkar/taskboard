@@ -119,8 +119,9 @@ $userEmail = htmlspecialchars($authUser['email']);
                 <div class="notif-list" id="notifList">
                     <div class="notif-empty">No notifications yet</div>
                 </div>
-                <div class="notif-popover-footer">
+                <div class="notif-popover-footer" style="display:flex; flex-direction:column; gap:6px; align-items:flex-start;">
                     <button class="btn-link btn-xs" id="enablePushBtn">Enable browser push notifications</button>
+                    <button class="btn-link btn-xs" id="testPushBtn" style="display:none; color: var(--accent); font-weight: 500;">🔔 Send test push notification</button>
                 </div>
             </div>
         </div>

@@ -1,4 +1,18 @@
 <?php
+// Prevent any PHP notices/warnings from corrupting JSON output
+ini_set('display_errors', '0');
+ob_start(function($buffer) {
+    $trimmed = trim($buffer);
+    $jsonStart = strpos($trimmed, '{');
+    $arrStart = strpos($trimmed, '[');
+    if ($jsonStart !== false || $arrStart !== false) {
+        $first = ($jsonStart !== false && $arrStart !== false) ? min($jsonStart, $arrStart) : ($jsonStart !== false ? $jsonStart : $arrStart);
+        if ($first > 0) {
+            return substr($trimmed, $first);
+        }
+    }
+    return $buffer;
+});
 session_start();
 header('Content-Type: application/json');
 require_once __DIR__ . '/db.php';
@@ -237,6 +251,33 @@ function ensureSchema(PDO $pdo): void
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ");
 
+    // 11. push_subscriptions
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `push_subscriptions` (
+          `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+          `user_id` INT UNSIGNED NOT NULL,
+          `endpoint` TEXT NOT NULL,
+          `p256dh` VARCHAR(255) NULL,
+          `auth` VARCHAR(255) NULL,
+          `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (`id`),
+          KEY `idx_push_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    // 12. notifications_sent
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `notifications_sent` (
+          `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+          `user_id` INT UNSIGNED NOT NULL,
+          `task_id` VARCHAR(64) NOT NULL,
+          `type` VARCHAR(50) NOT NULL,
+          `sent_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (`id`),
+          KEY `idx_notif_sent` (`user_id`, `task_id`, `type`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
     // Ensure columns in `boards`
     try {
         $c = $pdo->query("SHOW COLUMNS FROM `boards` LIKE 'color'")->fetch();
@@ -362,6 +403,220 @@ function getBoardName(PDO $pdo, string $boardId): string
     }
 }
 
+function tb_base64url_encode(string $data): string {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function tb_base64url_decode(string $data): string {
+    return base64_decode(strtr($data, '-_', '+/') . str_repeat('=', (4 - strlen($data) % 4) % 4));
+}
+
+function tb_der_to_raw_sig(string $der): string {
+    $pos = 2;
+    if (ord($der[1]) & 0x80) $pos += (ord($der[1]) & 0x7f);
+    $pos++; // skip 0x02 tag
+    $rLen = ord($der[$pos++]);
+    $r = substr($der, $pos, $rLen);
+    $pos += $rLen;
+    $pos++; // skip 0x02 tag
+    $sLen = ord($der[$pos++]);
+    $s = substr($der, $pos, $sLen);
+    return str_pad(ltrim($r, "\x00"), 32, "\x00", STR_PAD_LEFT) . str_pad(ltrim($s, "\x00"), 32, "\x00", STR_PAD_LEFT);
+}
+
+function getOpensslConfigPath(): ?string {
+    $candidates = [
+        __DIR__ . '/openssl.cnf',
+        getenv('OPENSSL_CONF') ?: '',
+        'C:/xampp/apache/bin/openssl.cnf',
+        'C:/xampp/php/extras/ssl/openssl.cnf',
+        'C:/xampp/apache/conf/openssl.cnf',
+        '/etc/ssl/openssl.cnf',
+        '/usr/lib/ssl/openssl.cnf',
+        '/usr/local/ssl/openssl.cnf',
+    ];
+    foreach ($candidates as $c) {
+        if ($c && file_exists($c)) {
+            putenv("OPENSSL_CONF={$c}");
+            $_ENV['OPENSSL_CONF'] = $c;
+            return $c;
+        }
+    }
+    $local = __DIR__ . '/openssl.cnf';
+    if (!file_exists($local)) {
+        @file_put_contents($local, "[req]\ndefault_bits = 2048\ndefault_md = sha256\ndistinguished_name = req_distinguished_name\n[req_distinguished_name]\ncommonName = TaskBoard\n");
+    }
+    if (file_exists($local)) {
+        putenv("OPENSSL_CONF={$local}");
+        $_ENV['OPENSSL_CONF'] = $local;
+        return $local;
+    }
+    return null;
+}
+
+/**
+ * Pure PHP Web Push Sender (RFC 8291 aes128gcm + RFC 8292 VAPID).
+ * Works on ANY PHP 7.3+ server with openssl & curl extensions — zero Composer dependencies needed!
+ */
+function sendWebPushNative(string $endpoint, ?string $userP256dh, ?string $userAuth, array $vapid, string $payload): array
+{
+    if (!$userP256dh || !$userAuth) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Missing subscriber keys'];
+    }
+    if (!extension_loaded('openssl')) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'OpenSSL extension not loaded in PHP'];
+    }
+    if (!extension_loaded('curl')) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'cURL extension not loaded in PHP'];
+    }
+
+    $pubRaw = tb_base64url_decode($vapid['publicKey']);
+    $privRaw = tb_base64url_decode($vapid['privateKey']);
+    if (strlen($pubRaw) !== 65 || strlen($privRaw) !== 32) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Invalid VAPID key lengths in vapid.php'];
+    }
+
+    // 1. Build VAPID JWT (RFC 8292)
+    $urlParts = parse_url($endpoint);
+    $audience = ($urlParts['scheme'] ?? 'https') . '://' . ($urlParts['host'] ?? '');
+    if (!empty($urlParts['port'])) {
+        $audience .= ':' . $urlParts['port'];
+    }
+
+    $jwtHeader = tb_base64url_encode(json_encode(['typ' => 'JWT', 'alg' => 'ES256']));
+    $jwtPayload = tb_base64url_encode(json_encode([
+        'aud' => $audience,
+        'exp' => time() + 43200,
+        'sub' => $vapid['subject'],
+    ]));
+    $jwtUnsigned = $jwtHeader . '.' . $jwtPayload;
+
+    $privDer = pack('H*', '30770201010420') . $privRaw . pack('H*', 'a00a06082a8648ce3d030107a144034200') . $pubRaw;
+    $privPem = "-----BEGIN EC PRIVATE KEY-----\n" . chunk_split(base64_encode($privDer), 64, "\n") . "-----END EC PRIVATE KEY-----\n";
+    $privKeyRes = openssl_pkey_get_private($privPem);
+    if (!$privKeyRes) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Unable to load VAPID private key: ' . openssl_error_string()];
+    }
+
+    $derSig = '';
+    if (!openssl_sign($jwtUnsigned, $derSig, $privKeyRes, OPENSSL_ALGO_SHA256)) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Unable to sign VAPID JWT: ' . openssl_error_string()];
+    }
+
+    $rawSig = tb_der_to_raw_sig($derSig);
+    $jwt = $jwtUnsigned . '.' . tb_base64url_encode($rawSig);
+
+    // 2. Encrypt Payload (RFC 8291 aes128gcm)
+    $clientPubRaw = tb_base64url_decode($userP256dh);
+    $clientAuthRaw = tb_base64url_decode($userAuth);
+    if (strlen($clientPubRaw) !== 65 || strlen($clientAuthRaw) !== 16) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Invalid client subscription key lengths'];
+    }
+
+    // Ephemeral key pair with config resolution
+    $cnf = getOpensslConfigPath();
+    $ecArgs = [
+        'curve_name' => 'prime256v1',
+        'private_key_type' => OPENSSL_KEYTYPE_EC,
+        'private_key_bits' => 2048,
+    ];
+    if ($cnf) {
+        $ecArgs['config'] = $cnf;
+    }
+    $ephemeral = @openssl_pkey_new($ecArgs);
+    if (!$ephemeral) {
+        $ephemeral = @openssl_pkey_new([
+            'curve_name' => 'prime256v1',
+            'private_key_type' => OPENSSL_KEYTYPE_EC,
+            'private_key_bits' => 2048,
+        ]);
+    }
+    if (!$ephemeral) {
+        $errs = [];
+        while ($msg = openssl_error_string()) { $errs[] = $msg; }
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Could not generate ephemeral EC key: ' . (implode('; ', $errs) ?: 'Check OpenSSL config')];
+    }
+    $details = openssl_pkey_get_details($ephemeral);
+    $localPubRaw = "\x04" . $details['ec']['x'] . $details['ec']['y'];
+
+    // Shared secret via ECDH
+    $clientPubDer = pack('H*', '3059301306072a8648ce3d020106082a8648ce3d030107034200') . $clientPubRaw;
+    $clientPubPem = "-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($clientPubDer), 64, "\n") . "-----END PUBLIC KEY-----\n";
+    $clientKeyRes = openssl_pkey_get_public($clientPubPem);
+    if (!$clientKeyRes) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Could not load client public key'];
+    }
+
+    $sharedSecret = openssl_pkey_derive($clientKeyRes, $ephemeral, 32);
+    if (!$sharedSecret) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'ECDH derivation failed'];
+    }
+
+    // Derive IKM
+    $keyInfo = "WebPush: info\x00" . $clientPubRaw . $localPubRaw;
+    $ikm = hash_hkdf('sha256', $sharedSecret, 32, $keyInfo, $clientAuthRaw);
+
+    // Random salt
+    $salt = random_bytes(16);
+
+    // Derive CEK & Nonce
+    $cek = hash_hkdf('sha256', $ikm, 16, "Content-Encoding: aes128gcm\x00", $salt);
+    $nonce = hash_hkdf('sha256', $ikm, 12, "Content-Encoding: nonce\x00", $salt);
+
+    $paddedPayload = $payload . "\x02";
+    $tag = '';
+    $ciphertext = openssl_encrypt($paddedPayload, 'aes-128-gcm', $cek, OPENSSL_RAW_DATA, $nonce, $tag, '', 16);
+    if ($ciphertext === false) {
+        return ['success' => false, 'statusCode' => 0, 'error' => 'Payload encryption failed'];
+    }
+
+    $recordSize = pack('N', 4096);
+    $idLen = chr(65);
+    $body = $salt . $recordSize . $idLen . $localPubRaw . $ciphertext . $tag;
+
+    // 3. Dispatch HTTP POST via cURL
+    $ch = curl_init($endpoint);
+    $headers = [
+        'Content-Type: application/octet-stream',
+        'Content-Encoding: aes128gcm',
+        'TTL: 86400',
+        'Authorization: vapid t=' . $jwt . ', k=' . $vapid['publicKey'],
+    ];
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr = curl_error($ch);
+    curl_close($ch);
+
+    $isSuccess = ($httpCode >= 200 && $httpCode < 300);
+    $errorMsg = null;
+    if (!$isSuccess) {
+        if ($curlErr) {
+            $errorMsg = 'cURL error: ' . $curlErr;
+        } else {
+            $errorMsg = "Push service responded with HTTP {$httpCode}";
+            if ($response && strlen(trim($response)) > 0) {
+                $trimmedResp = trim(strip_tags($response));
+                if (strlen($trimmedResp) < 200) {
+                    $errorMsg .= ': ' . $trimmedResp;
+                }
+            }
+        }
+    }
+    return [
+        'success' => $isSuccess,
+        'statusCode' => $httpCode,
+        'response' => $response,
+        'error' => $errorMsg,
+    ];
+}
+
 function sendPushNotification(PDO $pdo, int $targetUserId, string $title, ?string $message = null, ?string $url = null): void
 {
     try {
@@ -369,48 +624,10 @@ function sendPushNotification(PDO $pdo, int $targetUserId, string $title, ?strin
         $config = require __DIR__ . '/vapid.php';
         if (empty($config['publicKey']) || empty($config['privateKey'])) return;
 
-        $autoloads = [
-            __DIR__ . '/vendor/autoload.php',
-            __DIR__ . '/web-push-php-master/web-push-php-master/vendor/autoload.php',
-            __DIR__ . '/web-push-php-master/vendor/autoload.php',
-        ];
-        $loaded = false;
-        foreach ($autoloads as $al) {
-            if (file_exists($al)) { require_once $al; $loaded = true; break; }
-        }
-        if (!$loaded) {
-            $srcDirs = [
-                __DIR__ . '/web-push-php-master/web-push-php-master/src',
-                __DIR__ . '/web-push-php-master/src',
-            ];
-            foreach ($srcDirs as $src) {
-                if (is_dir($src)) {
-                    spl_autoload_register(function (string $class) use ($src) {
-                        $prefix = 'Minishlink\\WebPush\\';
-                        if (strpos($class, $prefix) !== 0) return;
-                        $rel  = str_replace('\\', '/', substr($class, strlen($prefix)));
-                        $file = $src . '/' . $rel . '.php';
-                        if (file_exists($file)) require_once $file;
-                    });
-                    $loaded = true;
-                    break;
-                }
-            }
-        }
-        if (!$loaded || !class_exists('Minishlink\\WebPush\\WebPush')) return;
-
         $subsStmt = $pdo->prepare('SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?');
         $subsStmt->execute([$targetUserId]);
         $subs = $subsStmt->fetchAll();
         if (empty($subs)) return;
-
-        $webPush = new \Minishlink\WebPush\WebPush([
-            'VAPID' => [
-                'subject' => $config['subject'],
-                'publicKey' => $config['publicKey'],
-                'privateKey' => $config['privateKey'],
-            ]
-        ]);
 
         $payload = json_encode([
             'title' => $title,
@@ -420,25 +637,50 @@ function sendPushNotification(PDO $pdo, int $targetUserId, string $title, ?strin
         ]);
 
         foreach ($subs as $s) {
-            try {
-                $sub = \Minishlink\WebPush\Subscription::create([
-                    'endpoint' => $s['endpoint'],
-                    'keys' => [
-                        'p256dh' => $s['p256dh'],
-                        'auth' => $s['auth'],
-                    ]
-                ]);
-                $webPush->queueNotification($sub, $payload);
-            } catch (Exception $e) {}
-        }
-
-        foreach ($webPush->flush() as $report) {
-            if (!$report->isSuccess() && $report->getResponse() && in_array($report->getResponse()->getStatusCode(), [404, 410])) {
-                $pdo->prepare('DELETE FROM push_subscriptions WHERE endpoint = ?')->execute([$report->getRequest()->getUri()->__toString()]);
+            $res = sendWebPushNative($s['endpoint'], $s['p256dh'], $s['auth'], $config, $payload);
+            if (!$res['success'] && in_array($res['statusCode'], [404, 410])) {
+                $pdo->prepare('DELETE FROM push_subscriptions WHERE endpoint = ?')->execute([$s['endpoint']]);
             }
         }
     } catch (Throwable $e) {
         // Non-fatal push failure
+    }
+}
+
+function triggerOpportunisticDueNotifications(PDO $pdo): void
+{
+    try {
+        $lockFile = sys_get_temp_dir() . '/tb_due_check.lock';
+        if (file_exists($lockFile) && (time() - filemtime($lockFile) < 60)) {
+            return;
+        }
+        @touch($lockFile);
+
+        $now = new DateTime('now');
+        $stmt = $pdo->prepare("
+            SELECT t.id AS task_id, t.title, t.description, t.due_date, t.due_time, b.user_id
+            FROM tasks t
+            INNER JOIN board_lists l ON l.id = t.list_id
+            INNER JOIN boards b ON b.id = l.board_id
+            WHERE t.completed = 0
+              AND t.due_date IS NOT NULL
+              AND t.due_time IS NOT NULL
+              AND CONCAT(t.due_date, ' ', t.due_time) <= ?
+              AND t.id NOT IN (SELECT task_id FROM notifications_sent WHERE type = 'due')
+            LIMIT 15
+        ");
+        $stmt->execute([$now->format('Y-m-d H:i:s')]);
+        $dueTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($dueTasks as $t) {
+            $uId = (int)$t['user_id'];
+            $taskId = $t['task_id'];
+            createNotification($pdo, $uId, null, 'due', '⏰ Task Due: ' . $t['title'], $t['description'] ?: 'This task is now due.', 'task', $taskId);
+            $pdo->prepare('INSERT IGNORE INTO notifications_sent (user_id, task_id, type) VALUES (?, ?, ?)')
+                ->execute([$uId, $taskId, 'due']);
+        }
+    } catch (Throwable $e) {
+        // Non-fatal
     }
 }
 
@@ -817,6 +1059,7 @@ $action = $_POST['action'] ?? ($body['action'] ?? '');
 try {
     $pdo = DB::get();
     ensureSchema($pdo);
+    triggerOpportunisticDueNotifications($pdo);
 } catch (Exception $e) {
     http_response_code(500);
     echo json_encode(['error' => 'db error', 'detail' => $e->getMessage()]);
@@ -2587,6 +2830,83 @@ try {
             $_SESSION['auth_user']['name'] = $name;
         }
         echo json_encode(['success' => true]);
+        break;
+    }
+
+    case 'getVapidStatus': {
+        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
+            || (($_SERVER['SERVER_PORT'] ?? '') == 443);
+        $vapidFileExists = file_exists(__DIR__ . '/vapid.php');
+        $vapidConfig = $vapidFileExists ? (require __DIR__ . '/vapid.php') : [];
+        $hasKeys = !empty($vapidConfig['publicKey']) && !empty($vapidConfig['privateKey']);
+
+        $stmtSubs = $pdo->prepare('SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?');
+        $stmtSubs->execute([$userId]);
+        $subCount = (int) $stmtSubs->fetchColumn();
+
+        echo json_encode([
+            'success' => true,
+            'isHttps' => $isHttps,
+            'isLocalhost' => in_array($_SERVER['HTTP_HOST'] ?? '', ['localhost', '127.0.0.1']) || strpos($_SERVER['HTTP_HOST'] ?? '', 'localhost:') === 0,
+            'vapidFileExists' => $vapidFileExists,
+            'hasKeys' => $hasKeys,
+            'publicKey' => $vapidConfig['publicKey'] ?? null,
+            'extensions' => [
+                'openssl' => extension_loaded('openssl'),
+                'curl' => extension_loaded('curl'),
+                'mbstring' => extension_loaded('mbstring'),
+            ],
+            'subCount' => $subCount,
+        ]);
+        break;
+    }
+
+    case 'testPushNotification': {
+        $config = file_exists(__DIR__ . '/vapid.php') ? (require __DIR__ . '/vapid.php') : [];
+        if (empty($config['publicKey']) || empty($config['privateKey'])) {
+            echo json_encode(['success' => false, 'error' => 'vapid.php is missing or does not have valid keys.']);
+            break;
+        }
+
+        $subsStmt = $pdo->prepare('SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?');
+        $subsStmt->execute([$userId]);
+        $subs = $subsStmt->fetchAll();
+
+        if (empty($subs)) {
+            echo json_encode(['success' => false, 'error' => 'No active push subscription found for your browser. Click "Enable browser push notifications" first.']);
+            break;
+        }
+
+        $payload = json_encode([
+            'title' => '🔔 Test Push Notification',
+            'body' => 'Web Push & VAPID are working properly on your server! 🎉',
+            'tag' => 'tb-test-' . time(),
+            'url' => './',
+        ]);
+
+        $results = [];
+        $anySuccess = false;
+        foreach ($subs as $s) {
+            $res = sendWebPushNative($s['endpoint'], $s['p256dh'], $s['auth'], $config, $payload);
+            $results[] = [
+                'endpoint' => substr($s['endpoint'], 0, 45) . '...',
+                'statusCode' => $res['statusCode'],
+                'success' => $res['success'],
+                'error' => $res['error'],
+            ];
+            if ($res['success']) {
+                $anySuccess = true;
+            } elseif (in_array($res['statusCode'], [404, 410])) {
+                $pdo->prepare('DELETE FROM push_subscriptions WHERE endpoint = ?')->execute([$s['endpoint']]);
+            }
+        }
+
+        echo json_encode([
+            'success' => $anySuccess,
+            'results' => $results,
+            'error' => $anySuccess ? null : ($results[0]['error'] ?? 'Push delivery failed.'),
+        ]);
         break;
     }
 

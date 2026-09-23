@@ -3,6 +3,7 @@
  * push.php — Save / update a browser push subscription for the logged-in user.
  * Called by app.js after Notification.requestPermission() is granted.
  */
+ini_set('display_errors', '0');
 session_start();
 header('Content-Type: application/json');
 require_once __DIR__ . '/db.php';
@@ -48,6 +49,20 @@ if (!$endpoint) {
 // ── Upsert subscription ───────────────────────────────────────────────────────
 try {
     $pdo = DB::get();
+
+    // Guarantee push_subscriptions table exists on any live server
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `push_subscriptions` (
+          `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+          `user_id` INT UNSIGNED NOT NULL,
+          `endpoint` TEXT NOT NULL,
+          `p256dh` VARCHAR(255) NULL,
+          `auth` VARCHAR(255) NULL,
+          `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (`id`),
+          KEY `idx_push_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
 
     // Check if this exact endpoint already exists for the user
     $stmt = $pdo->prepare(

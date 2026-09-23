@@ -2560,18 +2560,91 @@ async function registerServiceWorker() {
 function checkNotifPermission() {
     if (!('Notification' in window)) return;
     state.notifPermission = Notification.permission;
+    updatePushButtons();
+}
+
+async function updatePushButtons() {
+    const enableBtn = document.getElementById('enablePushBtn');
+    const testBtn = document.getElementById('testPushBtn');
+    if (!enableBtn) return;
+
+    if (!('Notification' in window) || !('serviceWorker' in navigator)) {
+        enableBtn.style.display = 'none';
+        if (testBtn) testBtn.style.display = 'none';
+        return;
+    }
+
+    const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    if (location.protocol !== 'https:' && !isLocal) {
+        enableBtn.textContent = '⚠️ Push requires HTTPS on live server';
+        enableBtn.title = 'Web Push notifications require an SSL certificate (https://) on public domains';
+        enableBtn.style.color = '#eab308';
+        if (testBtn) testBtn.style.display = 'none';
+        return;
+    }
+
+    if (Notification.permission === 'granted') {
+        enableBtn.textContent = '✓ Push notifications enabled';
+        enableBtn.style.color = '#10b981';
+        enableBtn.disabled = true;
+        if (testBtn) testBtn.style.display = '';
+    } else if (Notification.permission === 'denied') {
+        enableBtn.textContent = '❌ Push notifications blocked';
+        enableBtn.title = 'Please reset notification permission in browser site settings';
+        enableBtn.disabled = true;
+        if (testBtn) testBtn.style.display = 'none';
+    } else {
+        enableBtn.textContent = 'Enable browser push notifications';
+        enableBtn.style.color = '';
+        enableBtn.disabled = false;
+        if (testBtn) testBtn.style.display = 'none';
+    }
 }
 
 async function subscribePush() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return false;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        showToast('Push notifications not supported in this browser.', 'error');
+        return false;
+    }
+
+    const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    if (location.protocol !== 'https:' && !isLocal) {
+        showToast('Push notifications require HTTPS on live servers. Please access via https://', 'error');
+        return false;
+    }
+
     try {
         const reg = _swReg || await navigator.serviceWorker.ready;
         const vkRes = await fetch('vapid_public.php');
-        if (!vkRes.ok) return false;
+        if (!vkRes.ok) {
+            const errData = await vkRes.json().catch(() => ({}));
+            showToast('VAPID error: ' + (errData.error || 'vapid.php not found'), 'error');
+            return false;
+        }
         const { publicKey } = await vkRes.json();
-        if (!publicKey) return false;
+        if (!publicKey) {
+            showToast('VAPID public key is missing on server.', 'error');
+            return false;
+        }
 
         let sub = await reg.pushManager.getSubscription();
+        if (sub) {
+            // Verify if subscription key matches current server VAPID key
+            const currentKeyBytes = urlBase64ToUint8Array(publicKey);
+            const subKey = sub.options?.applicationServerKey;
+            let keyMatches = false;
+            if (subKey) {
+                const subKeyBytes = new Uint8Array(subKey);
+                if (subKeyBytes.length === currentKeyBytes.length) {
+                    keyMatches = subKeyBytes.every((v, i) => v === currentKeyBytes[i]);
+                }
+            }
+            if (!keyMatches) {
+                await sub.unsubscribe();
+                sub = null;
+            }
+        }
+
         if (!sub) {
             sub = await reg.pushManager.subscribe({
                 userVisibleOnly: true,
@@ -2584,9 +2657,15 @@ async function subscribePush() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(sub.toJSON())
         });
-        return res.ok;
+        if (!res.ok) {
+            const errJson = await res.json().catch(() => ({}));
+            showToast('Failed to save subscription: ' + (errJson.error || errJson.detail || 'Server error'), 'error');
+            return false;
+        }
+        return true;
     } catch (err) {
         console.warn('Push subscription failed:', err);
+        showToast('Push setup error: ' + (err.message || 'Check browser permissions'), 'error');
         return false;
     }
 }
@@ -2599,11 +2678,15 @@ async function requestNotifPermission() {
     const perm = await Notification.requestPermission();
     state.notifPermission = perm;
     if (perm === 'granted') {
-        await subscribePush();
-        showToast('Push notifications enabled!', 'success');
+        const ok = await subscribePush();
+        if (ok) {
+            showToast('Push notifications enabled! 🎉', 'success');
+        }
+        updatePushButtons();
         scheduleAllNotifications();
     } else {
         showToast('Notification permission was not granted', 'info');
+        updatePushButtons();
     }
 }
 
@@ -3092,6 +3175,9 @@ function setupEventListeners() {
         notifBell.addEventListener('click', e => {
             e.stopPropagation();
             notifPop.classList.toggle('open');
+            if (notifPop.classList.contains('open')) {
+                updatePushButtons();
+            }
         });
         document.addEventListener('click', e => {
             if (!notifPop.contains(e.target) && e.target !== notifBell) {
@@ -3106,6 +3192,15 @@ function setupEventListeners() {
     });
 
     document.getElementById('enablePushBtn')?.addEventListener('click', requestNotifPermission);
+    document.getElementById('testPushBtn')?.addEventListener('click', async () => {
+        showToast('Sending test push notification...', 'info');
+        const res = await apiCall('testPushNotification');
+        if (res && res.success) {
+            showToast('Test push notification delivered! 🔔', 'success');
+        } else {
+            showToast(res?.error || 'Test push failed. Ensure push is enabled and server is on HTTPS.', 'error');
+        }
+    });
 
     // View Switcher (Kanban, List, Calendar)
     document.querySelectorAll('.view-mode-btn').forEach(btn => {

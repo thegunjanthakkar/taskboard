@@ -1,0 +1,8 @@
+# Minimal OpenSSL configuration for WebPush / VAPID key generation
+[req]
+default_bits = 2048
+default_md = sha256
+distinguished_name = req_distinguished_name
+
+[req_distinguished_name]
+commonName = TaskBoard
