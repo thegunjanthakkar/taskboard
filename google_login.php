@@ -7,9 +7,15 @@ $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
 if (strpos($host, '127.0.0.1') === 0) {
     $host = preg_replace('/^127\.0\.0\.1/', 'localhost', $host);
 }
-$isHttps = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
+    || (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on')
+    || (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)
+    || (strpos($host, 'coida.in') !== false);
 $scheme = $isHttps ? 'https' : 'http';
-$redirectUri = $scheme . '://' . $host . '/taskboard/google_callback.php';
+$scriptDir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+$basePath = ($scriptDir && $scriptDir !== '/' && $scriptDir !== '.') ? $scriptDir : ((strpos($host, 'localhost') !== false) ? '/taskboard' : '');
+$redirectUri = $scheme . '://' . $host . $basePath . '/google_callback.php';
 $scope = urlencode('openid email profile');
 $state = bin2hex(random_bytes(8));
 $sevenDays = 7 * 86400; // 7 days (604800 seconds)
