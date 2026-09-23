@@ -13,7 +13,19 @@ ob_start(function($buffer) {
     }
     return $buffer;
 });
-session_start();
+$sevenDays = 7 * 86400; // 7 days (604800 seconds)
+ini_set('session.gc_maxlifetime', (string) $sevenDays);
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+session_set_cookie_params([
+    'lifetime' => $sevenDays,
+    'path'     => '/',
+    'secure'   => $isHttps,
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 header('Content-Type: application/json');
 require_once __DIR__ . '/db.php';
 
@@ -1138,20 +1150,20 @@ try {
             $stmtUpcoming->execute(array_merge($boardIds, [$sevenDays]));
             $upcomingTasks = $stmtUpcoming->fetchAll();
 
-            // 3. Recent activity feed (strictly for this user - other users cannot see each other's activity)
+            // 3. Recent activity feed (shows activities on all accessible boards, including shared boards)
             $stmtAct = $pdo->prepare("
                 SELECT a.id, a.board_id, a.task_id, a.action, a.details, a.created_at,
                        u.name AS user_name, u.email AS user_email,
-                       b.name AS board_name, t.title AS task_title
+                       b.name AS board_name, b.color AS board_color, t.title AS task_title
                 FROM activity_logs a
                 LEFT JOIN users u ON u.id = a.user_id
                 LEFT JOIN boards b ON b.id = a.board_id
                 LEFT JOIN tasks t ON t.id = a.task_id
-                WHERE a.user_id = ? AND (a.board_id IN ($inPlaceholder) OR a.board_id IS NULL)
+                WHERE (a.board_id IN ($inPlaceholder)) OR (a.user_id = ? AND a.board_id IS NULL)
                 ORDER BY a.created_at DESC
                 LIMIT 15
             ");
-            $stmtAct->execute(array_merge([$userId], $boardIds));
+            $stmtAct->execute(array_merge($boardIds, [$userId]));
             $recentActivity = $stmtAct->fetchAll();
         } else {
             $recentActivity = [];
@@ -1211,11 +1223,11 @@ try {
             LEFT JOIN users u ON u.id = a.user_id
             LEFT JOIN boards b ON b.id = a.board_id
             LEFT JOIN tasks t ON t.id = a.task_id
-            WHERE a.user_id = ? AND (a.board_id IN ($inPlaceholder) OR a.board_id IS NULL)
+            WHERE (a.board_id IN ($inPlaceholder)) OR (a.user_id = ? AND a.board_id IS NULL)
             ORDER BY a.created_at DESC
             LIMIT 100
         ");
-        $stmtAct->execute(array_merge([$userId], $boardIds));
+        $stmtAct->execute(array_merge($boardIds, [$userId]));
         $activity = $stmtAct->fetchAll();
 
         echo json_encode(['success' => true, 'activity' => $activity]);
@@ -1621,9 +1633,9 @@ try {
                 $listId,
                 $title,
                 trim($taskData['description'] ?? ''),
-                $taskData['start_date'] ?: null,
-                $taskData['due_date'] ?: null,
-                $taskData['due_time'] ?: null,
+                ($taskData['start_date'] ?? null) ?: null,
+                ($taskData['due_date'] ?? null) ?: null,
+                ($taskData['due_time'] ?? null) ?: null,
                 $priority,
                 $position,
                 $assignedTo,
@@ -1706,9 +1718,9 @@ try {
             $listId,
             $title,
             trim($taskData['description'] ?? ''),
-            $taskData['start_date'] ?: null,
-            $taskData['due_date'] ?: null,
-            $taskData['due_time'] ?: null,
+            ($taskData['start_date'] ?? null) ?: null,
+            ($taskData['due_date'] ?? null) ?: null,
+            ($taskData['due_time'] ?? null) ?: null,
             $priority,
             $assignedTo,
             $recurrence,

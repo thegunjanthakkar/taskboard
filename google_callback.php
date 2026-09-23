@@ -1,7 +1,19 @@
 <?php
 // Handle Google OAuth callback: exchange code for tokens and get userinfo.
 require_once __DIR__ . '/db.php';
-session_start();
+$sevenDays = 7 * 86400; // 7 days (604800 seconds)
+ini_set('session.gc_maxlifetime', (string) $sevenDays);
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+session_set_cookie_params([
+    'lifetime' => $sevenDays,
+    'path'     => '/',
+    'secure'   => $isHttps,
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 
 if (!isset($_GET['code']) || !isset($_GET['state']) || $_GET['state'] !== ($_SESSION['oauth_state'] ?? '')) {
     echo 'Invalid OAuth response.';
@@ -102,6 +114,14 @@ try {
 
     $_SESSION['auth_user'] = ['id' => $userId, 'email' => $user['email'], 'name' => $displayName];
     $_SESSION['user_id'] = 'user_' . $userId;
+    session_regenerate_id(true);
+    setcookie(session_name(), session_id(), [
+        'expires'  => time() + $sevenDays,
+        'path'     => '/',
+        'secure'   => $isHttps,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
 
     $targetBoard = $_SESSION['oauth_redirect_board'] ?? null;
     unset($_SESSION['oauth_redirect_board']);

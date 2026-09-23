@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tasksboard-v11';
+const CACHE_NAME = 'tasksboard-v14';
 const STATIC_ASSETS = [
     './',
     './style.css',

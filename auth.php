@@ -1,6 +1,18 @@
 <?php
 ini_set('display_errors', '0');
-session_start();
+$sevenDays = 7 * 86400; // 7 days (604800 seconds)
+ini_set('session.gc_maxlifetime', (string) $sevenDays);
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+session_set_cookie_params([
+    'lifetime' => $sevenDays,
+    'path'     => '/',
+    'secure'   => $isHttps,
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/db.php';
 
@@ -46,6 +58,14 @@ if ($action === 'signup') {
 
         $_SESSION['auth_user'] = ['id' => $userId, 'email' => $email, 'name' => $defaultName];
         $_SESSION['user_id'] = 'user_' . $userId;
+        session_regenerate_id(true);
+        setcookie(session_name(), session_id(), [
+            'expires'  => time() + $sevenDays,
+            'path'     => '/',
+            'secure'   => $isHttps,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
         echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
         exit;
     }
@@ -58,6 +78,14 @@ if ($action === 'signup') {
 
     $_SESSION['auth_user'] = ['id' => $userId, 'email' => $email, 'name' => $defaultName];
     $_SESSION['user_id'] = 'user_' . $userId;
+    session_regenerate_id(true);
+    setcookie(session_name(), session_id(), [
+        'expires'  => time() + $sevenDays,
+        'path'     => '/',
+        'secure'   => $isHttps,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
     echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
     exit;
 
@@ -82,12 +110,31 @@ if ($action === 'signup') {
     $name = $row['name'] ?: explode('@', $email)[0];
     $_SESSION['auth_user'] = ['id' => (int) $row['id'], 'email' => $email, 'name' => $name];
     $_SESSION['user_id'] = 'user_' . $row['id'];
+    session_regenerate_id(true);
+    setcookie(session_name(), session_id(), [
+        'expires'  => time() + $sevenDays,
+        'path'     => '/',
+        'secure'   => $isHttps,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
     echo json_encode(['ok' => true, 'user' => $_SESSION['auth_user']]);
     exit;
 
 } elseif ($action === 'logout') {
-    unset($_SESSION['auth_user']);
-    unset($_SESSION['user_id']);
+    $_SESSION = [];
+    if (ini_get("session.use_cookies")) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', [
+            'expires'  => time() - 42000,
+            'path'     => $params['path'] ?? '/',
+            'domain'   => $params['domain'] ?? '',
+            'secure'   => $params['secure'] ?? false,
+            'httponly' => $params['httponly'] ?? true,
+            'samesite' => $params['samesite'] ?? 'Lax',
+        ]);
+    }
+    session_destroy();
     echo json_encode(['ok' => true]);
     exit;
 

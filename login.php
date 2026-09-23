@@ -1,5 +1,16 @@
-<?php
-session_start();
+$sevenDays = 7 * 86400; // 7 days (604800 seconds)
+ini_set('session.gc_maxlifetime', (string) $sevenDays);
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+session_set_cookie_params([
+    'lifetime' => $sevenDays,
+    'path'     => '/',
+    'secure'   => $isHttps,
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 
 $targetBoard = !empty($_GET['board']) ? trim($_GET['board']) : '';
 $redirectUrl = 'index.php' . ($targetBoard ? '?board=' . urlencode($targetBoard) : '');

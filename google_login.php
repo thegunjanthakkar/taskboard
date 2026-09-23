@@ -12,7 +12,18 @@ $scheme = $isHttps ? 'https' : 'http';
 $redirectUri = $scheme . '://' . $host . '/taskboard/google_callback.php';
 $scope = urlencode('openid email profile');
 $state = bin2hex(random_bytes(8));
-session_start();
+$sevenDays = 7 * 86400; // 7 days (604800 seconds)
+ini_set('session.gc_maxlifetime', (string) $sevenDays);
+session_set_cookie_params([
+    'lifetime' => $sevenDays,
+    'path'     => '/',
+    'secure'   => $isHttps,
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 if (!empty($_GET['board'])) {
     $_SESSION['oauth_redirect_board'] = trim($_GET['board']);
 }

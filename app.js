@@ -329,16 +329,28 @@ function renderDashboard(data) {
                 const timeAgo = formatTimeAgo(act.created_at);
                 const initials = getInitials(act.user_name || act.user_email || 'U');
 
+                let boardTag = '';
+                if (act.board_name) {
+                    boardTag = `<span class="board-mini-tag" style="--tag-color: ${act.board_color || '#4f8ef7'}; font-size: 0.68rem; margin-left: 6px;">${escHtml(act.board_name)}</span>`;
+                }
+
                 item.innerHTML = `
                     <div class="activity-avatar">${initials}</div>
                     <div class="activity-body">
                         <div class="activity-line">
                             <strong>${escHtml(act.user_name || act.user_email)}</strong>
                             <span>${escHtml(act.details || act.action)}</span>
+                            ${boardTag}
                         </div>
                         <div class="activity-time">${timeAgo}</div>
                     </div>
                 `;
+
+                if (act.task_id) {
+                    item.style.cursor = 'pointer';
+                    item.addEventListener('click', () => openTaskDrawer(act.task_id));
+                }
+
                 activityContainer.appendChild(item);
             });
 
@@ -388,12 +400,12 @@ function renderSidebar() {
             const a = document.createElement('a');
             a.className = 'nav-item' + (board.id === state.activeBoardId && state.currentView === 'board' ? ' active' : '');
             a.href = '#';
-            const ownerBadge = board.owner_name ? `<span class="shared-by-badge">by ${escHtml(board.owner_name)}</span>` : '';
+            const ownerName = board.owner_name || board.owner_email || '';
+            a.title = ownerName ? `${board.name} • Owned by ${ownerName}` : board.name;
             a.innerHTML = `
                 <span class="board-nav-dot" style="background: ${board.color || '#4f8ef7'}"></span>
-                <span class="board-item-name" title="${escHtml(board.name)}${board.owner_name ? ' (by ' + escHtml(board.owner_name) + ')' : ''}">${escHtml(board.name)}</span>
-                ${ownerBadge}
-                <span class="shared-role-pill">${escHtml(board.user_role || 'shared')}</span>
+                <span class="board-item-name">${escHtml(board.name)}</span>
+                <span class="shared-role-pill" title="Role: ${escHtml(board.user_role || 'shared')}">${escHtml(board.user_role || 'shared')}</span>
             `;
             a.addEventListener('click', e => {
                 e.preventDefault();
@@ -2460,9 +2472,11 @@ function renderDueToday() {
     const dueTasks = [];
 
     state.boards.forEach(b => {
+        if (b.is_archived) return;
         b.lists.forEach(l => {
             l.tasks.forEach(t => {
-                if (t.due_date && (t.due_date <= todayStr || (!t.completed && t.due_date === todayStr))) {
+                // Show ONLY today's remaining due tasks (not completed tasks, not past/future dates)
+                if (!t.completed && !t.is_archived && t.due_date === todayStr) {
                     dueTasks.push({ task: t, list: l, board: b });
                 }
             });
@@ -2530,9 +2544,10 @@ function updateDueTodayCount() {
     const today = getTodayStr();
     let count = 0;
     state.boards.forEach(b => {
+        if (b.is_archived) return;
         b.lists.forEach(l => {
             l.tasks.forEach(t => {
-                if (!t.completed && t.due_date && t.due_date <= today) count++;
+                if (!t.completed && !t.is_archived && t.due_date === today) count++;
             });
         });
     });
