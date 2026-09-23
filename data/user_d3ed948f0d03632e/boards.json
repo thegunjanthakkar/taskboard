@@ -1,0 +1,27 @@
+{
+    "boards": [
+        {
+            "id": "board_6a001fd37ffa2",
+            "name": "Main Board",
+            "created_at": "2026-05-10 08:04:03",
+            "lists": [
+                {
+                    "id": "list_6a001fd3810c0",
+                    "name": "6th Semester",
+                    "tasks": [
+                        {
+                            "id": "task_6a00200d12b92_19470071",
+                            "title": "dm",
+                            "description": "",
+                            "due_date": "2026-05-10",
+                            "due_time": "00:34",
+                            "priority": "medium",
+                            "completed": false,
+                            "created_at": "2026-05-10 08:05:01"
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
