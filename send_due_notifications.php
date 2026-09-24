@@ -34,6 +34,9 @@ if (php_sapi_name() !== 'cli') {
     header('Content-Type: text/plain; charset=utf-8');
 }
 
+// ── Timezone (ensures server compares against user's local clock) ────────────
+date_default_timezone_set(getenv('APP_TIMEZONE') ?: 'Asia/Kolkata');
+
 require_once __DIR__ . '/db.php';
 
 // ── Load VAPID config ─────────────────────────────────────────────────────────
@@ -272,11 +275,11 @@ $stmt->execute([$now->format('Y-m-d H:i:s')]);
 $tasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 if (!$tasks) {
-    echo date('c') . " — No due tasks.\n";
+    echo date('Y-m-d H:i:s T') . " — Checked for tasks due on or before {$now->format('Y-m-d H:i:s')} — No due tasks.\n";
     exit(0);
 }
 
-echo date('c') . " — Found " . count($tasks) . " task(s) to notify.\n";
+echo date('Y-m-d H:i:s T') . " — Found " . count($tasks) . " task(s) to notify.\n";
 
 // ── Send notifications ────────────────────────────────────────────────────────
 foreach ($tasks as $task) {
